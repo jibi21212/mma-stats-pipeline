@@ -1,0 +1,20 @@
+# Build artifacts
+scraper-go/ufcscraper.exe
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# SQLite transient sidecar files (the data/ufc.db file itself IS committed)
+data/*.db-wal
+data/*.db-shm
+
+# Generated ML artifacts (regenerate: python ml/run_all.py --min-fights 5 --k 6)
+ml/outputs/
+
+# Local-only personal study notes (not shared)
+notes/

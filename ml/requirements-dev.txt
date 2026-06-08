@@ -1,0 +1,5 @@
+# Dev/test dependencies (install on top of requirements.txt):
+#   pip install -r requirements.txt -r requirements-dev.txt
+# Run the suite from the ml/ directory:
+#   python -m pytest -q
+pytest>=8

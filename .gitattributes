@@ -1,0 +1,9 @@
+# Normalize line endings: LF in the repo and the working tree (Go's gofmt and
+# Python both expect LF; avoids CRLF churn on Windows).
+* text=auto eol=lf
+
+# Binary assets: never line-ending-convert or text-diff these.
+*.db binary
+*.png binary
+*.jpg binary
+*.ipynb -text
