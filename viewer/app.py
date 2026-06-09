@@ -18,6 +18,8 @@ import streamlit as st
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.normpath(os.path.join(_HERE, "..", "data", "ufc.db"))
 ML_OUTPUTS = os.path.normpath(os.path.join(_HERE, "..", "ml", "outputs"))
+ML_DIR = os.path.normpath(os.path.join(_HERE, "..", "ml"))
+PREDICTOR_MODEL = os.path.normpath(os.path.join(ML_DIR, "models", "predictor.joblib"))
 
 
 @st.cache_data(show_spinner=False)
@@ -189,6 +191,104 @@ def render_archetypes():
             st.image(p, caption=cap, width="stretch")
 
 
+@st.cache_resource(show_spinner=False)
+def _load_predictor(model_path: str):
+    """Import ml/predict and load the saved model payload (cached).
+
+    Returns ``(predict_module, payload)`` or raises. The ml/ dir is put on
+    sys.path so ``import predict`` (and its ``import db``) resolve.
+    """
+    import sys
+    if ML_DIR not in sys.path:
+        sys.path.insert(0, ML_DIR)
+    import predict as predict_module
+    payload = predict_module.load_model(model_path, force=True)
+    return predict_module, payload
+
+
+def render_predictor():
+    st.header("Fight Predictor")
+    st.caption(
+        "Predicts P(fighter A beats fighter B) from a leakage-safe, weight-class-gated "
+        "model (Elo, age, activity, form). Cross-weight / cross-gender matchups are refused."
+    )
+
+    if not os.path.exists(PREDICTOR_MODEL):
+        st.info(
+            "No trained model found. Train it first:\n\n"
+            "`cd ml && python predict.py --train`"
+        )
+        return
+
+    try:
+        predict_module, payload = _load_predictor(PREDICTOR_MODEL)
+    except Exception as e:  # noqa: BLE001 - surface any load error in the UI
+        st.error(f"Could not load the predictor model:\n\n`{e}`\n\n"
+                 "Re-train it: `cd ml && python predict.py --train`")
+        return
+
+    roster = sorted(payload["snapshots"].keys())
+    metrics = payload.get("metrics", {})
+    test_acc = metrics.get("test_accuracy")
+
+    c1, c2 = st.columns(2)
+    name_a = c1.selectbox("Fighter A", roster, index=0, key="pred_a")
+    default_b = 1 if len(roster) > 1 else 0
+    name_b = c2.selectbox("Fighter B", roster, index=default_b, key="pred_b")
+
+    if name_a == name_b:
+        st.warning("Pick two different fighters.")
+        return
+
+    res = predict_module.predict(name_a, name_b, path=PREDICTOR_MODEL)
+
+    if not res.get("allowed"):
+        st.error(f"Matchup refused: {res.get('reason')}")
+        # Still show the tale of the tape if we have it (helps explain the gate).
+        ta, tb = res.get("tale_a"), res.get("tale_b")
+        if ta and tb:
+            st.dataframe(_tape_frame(name_a, name_b, ta, tb), width="stretch")
+        return
+
+    pa, pb = res["prob_a"], res["prob_b"]
+    m1, m2 = st.columns(2)
+    m1.metric(f"P({name_a} wins)", f"{pa:.1%}")
+    m2.metric(f"P({name_b} wins)", f"{pb:.1%}")
+    st.progress(float(pa))
+
+    if res.get("low_confidence"):
+        st.warning("Weight class unknown for one fighter -> low confidence.")
+
+    st.markdown("**Tale of the tape**")
+    st.dataframe(_tape_frame(name_a, name_b, res["tale_a"], res["tale_b"]),
+                 width="stretch", hide_index=True)
+
+    if test_acc is not None:
+        st.caption(
+            f"Model: {metrics.get('best_model', '?')}. Held-out (temporal) test accuracy "
+            f"~{test_acc:.1%}. Honest MMA prediction lands ~60-65%; treat probabilities "
+            "as estimates, not certainties."
+        )
+
+
+def _tape_frame(name_a, name_b, ta, tb):
+    """Build a side-by-side tale-of-the-tape DataFrame for two fighters."""
+    rows = [
+        ("Elo", ta.get("elo"), tb.get("elo")),
+        ("Age", ta.get("age"), tb.get("age")),
+        ("Record (W-L)", ta.get("record"), tb.get("record")),
+        ("Reach (in)", ta.get("reach_in"), tb.get("reach_in")),
+        ("Height (in)", ta.get("height_in"), tb.get("height_in")),
+        ("Stance", ta.get("stance"), tb.get("stance")),
+        ("Recent win rate", ta.get("recent_winrate"), tb.get("recent_winrate")),
+        ("Form (recent - career)", ta.get("form_delta"), tb.get("form_delta")),
+        ("Layoff (days)", ta.get("layoff_days"), tb.get("layoff_days")),
+    ]
+    return pd.DataFrame(
+        [{"Stat": s, name_a: _fmt(a), name_b: _fmt(b)} for s, a, b in rows]
+    )
+
+
 def main():
     st.set_page_config(page_title="UFC Stats Viewer", page_icon="(MMA)", layout="wide")
     st.sidebar.title("UFC Stats Viewer")
@@ -204,7 +304,10 @@ def main():
     fights = load_table(db_path, "fights")
     rounds = load_table(db_path, "round_stats")
 
-    section = st.sidebar.radio("View", ["Overview", "Fighters", "Events", "Fights", "Archetypes (ML)"])
+    section = st.sidebar.radio(
+        "View",
+        ["Overview", "Fighters", "Events", "Fights", "Archetypes (ML)", "Fight Predictor"],
+    )
     st.sidebar.caption(f"{len(fighters):,} fighters | {len(events):,} events | {len(fights):,} fights")
     st.sidebar.caption("Read-only local viewer. Not hosted.")
 
@@ -216,8 +319,10 @@ def main():
         render_events(events, fights)
     elif section == "Fights":
         render_fights(fights, rounds)
-    else:
+    elif section == "Archetypes (ML)":
         render_archetypes()
+    else:
+        render_predictor()
 
 
 if __name__ == "__main__":

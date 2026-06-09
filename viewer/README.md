@@ -26,6 +26,7 @@ Pick a view from the sidebar:
 | **Events** | All events (newest first); pick one to see its fight card. |
 | **Fights** | Filter fights by fighter; pick a `fight_id` to see both fighters' round-by-round stats. |
 | **Archetypes (ML)** | The cluster profiles, a searchable fighter->cluster table, and the charts from `ml/outputs/` (run `python ml/run_all.py --min-fights 5 --k 6` first). |
+| **Fight Predictor** | Pick two fighters: predicts `P(A beats B)` from the leakage-safe, weight-class-gated model in `ml/models/predictor.joblib` (train it with `cd ml && python predict.py --train`). Cross-weight / cross-gender matchups are **refused**; allowed matchups show win probabilities, a side-by-side tale of the tape, and the model's held-out accuracy. |
 
 ## Notes
 

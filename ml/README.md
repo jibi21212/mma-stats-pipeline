@@ -179,6 +179,80 @@ fractions, heights/reach in inches, weight in lbs, control time in seconds.
 
 ---
 
+## Fight-outcome predictor (`predict.py`)
+
+A **supervised** add-on alongside the unsupervised analyses: it predicts
+`P(fighter A beats fighter B)` from a leakage-safe, weight-class-gated model
+covering **age**, **activity** (layoff / recent frequency), **career
+trajectory** (Elo momentum / form), and **skill** (Elo).
+
+```bash
+cd ml
+python predict.py --train                 # train both models, save the best, print metrics
+python predict.py --a "Israel Adesanya" --b "Robert Whittaker"   # one prediction
+```
+
+The trained model is written to `ml/models/predictor.joblib` (gitignored —
+regenerate with `--train`). The Streamlit viewer's **Fight Predictor** page
+loads this file.
+
+### Three correctness invariants
+
+1. **No temporal leakage.** Every feature for a historical fight is computed
+   from each fighter's **prior fights only** (strictly before that fight's
+   date), by walking all fights chronologically and snapshotting each fighter's
+   running state *before* applying the fight's result. The post-hoc career
+   aggregates in the `fighters` table (`slpm, str_acc, sapm, str_def, td_avg,
+   td_acc, td_def, sub_avg`) are **never** used — they are computed over each
+   fighter's whole career (incl. this and future fights) and would leak the
+   label. Only **static** physical attributes (`reach_in, height_in, stance,
+   date_of_birth`) are read from `fighters`. The train/test split is
+   **temporal** (train `< 2023-01-01`, test on/after), never random. Fights with
+   no real winner (method containing draw / NC / overturn) are dropped from the
+   label set.
+2. **Symmetry.** Features are **signed differences** (`A − B`); each training
+   fight is emitted in **both** orderings (winner-as-A label 1, loser-as-A label
+   0). At predict time both orderings are run and averaged, so
+   `P(A beats B) == 1 − P(B beats A)` exactly.
+3. **Weight-class gating.** Each `weight_class` string is normalised to a
+   division on one of two **separate** ordinal ladders (men 1–8, women 1–4). A
+   matchup is allowed only if both fighters share a gender ladder **and** the
+   minimum division distance over the divisions they've actually fought in is
+   `≤ 1`; otherwise it is **refused** (e.g. a Bantam/Featherweight vs a
+   Heavyweight is ~5–6 steps apart → refused). Cross-gender → refused. A fighter
+   with no resolvable division (only catch/open weight) → allowed but flagged
+   low confidence.
+
+### Features (all leakage-safe, as-of fight date, used as A − B differences)
+
+`elo_pre` (running Elo, start 1500, K=32), `elo_momentum` (Elo now minus Elo ~5
+fights ago), `age_years`, `n_prior_fights`, `winrate_prior`, `recent_winrate`
+(last 5), `form_delta` (recent − career), `days_since_last` (layoff;
+`is_debut` flag + 365-day sentinel for debuts), `fights_last_365` (activity),
+`reach_in`, `height_in`, `southpaw`. Plus two symmetric fight-context features:
+`stance_mismatch` (orthodox-vs-southpaw) and `title_bout`. (As-of-date
+striking/grappling rates from `round_stats` are a noted future enhancement —
+skipped to keep the leakage proof simple.)
+
+### Models & evaluation
+
+Two models are trained on the symmetric, leakage-safe difference matrix (NaNs
+median-imputed): **LogisticRegression** (in a `StandardScaler` pipeline) and
+**HistGradientBoostingClassifier**. The better model **by test log-loss** is
+persisted. On the temporal hold-out the predictor reports accuracy, log-loss and
+Brier score, alongside three baselines (pick higher pre-fight Elo, pick more
+experienced, base rate). Honest MMA models land **~60–65%**; test accuracy
+`> ~70%` is a **red flag for leakage** (the trainer prints a warning if it sees
+that). The saved payload bundles the fitted pipeline, the feature column order,
+each fighter's **current** snapshot (as of `max(fights.date)`, not the wall
+clock), their division set, and the metrics.
+
+```bash
+cd ml && python -m pytest tests/test_predict.py -q   # normaliser, gating, symmetry, leakage, Elo
+```
+
+---
+
 ## Interpreting the charts
 
 **`pca_scatter.png` - the archetype map.** Each dot is a fighter. PCA compresses the 20 features
@@ -217,6 +291,8 @@ few broad ones. It's an alternative view of the same structure KMeans captures a
 | `db.py` | Read-only SQLite access + feature engineering (`build_fighter_features`, `load_*`, `get_connection`). |
 | `archetypes.py` | Analysis A: scaling, PCA, KMeans/Agglomerative clustering, plots (`run_archetypes`). |
 | `relationships.py` | Analysis B: correlations + association-rule mining (`run_relationships`). |
+| `predict.py` | Supervised fight-outcome predictor: leakage-safe features, Elo, weight-class gating, symmetric `predict(a, b)` + `--train` CLI. |
+| `models/` | Trained predictor (`predictor.joblib`), gitignored — regenerate with `python predict.py --train`. |
 | `run_all.py` | Argparse CLI that wires the three stages together. |
 | `notebook.ipynb` | Interactive walkthrough of the same pipeline. |
 | `requirements.txt` | Python dependencies. |

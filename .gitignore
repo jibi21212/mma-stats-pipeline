@@ -16,5 +16,8 @@ data/*.db-shm
 # Generated ML artifacts (regenerate: python ml/run_all.py --min-fights 5 --k 6)
 ml/outputs/
 
+# Trained fight-outcome predictor (regenerate: cd ml && python predict.py --train)
+ml/models/
+
 # Local-only personal study notes (not shared)
 notes/
