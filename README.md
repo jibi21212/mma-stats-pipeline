@@ -11,6 +11,35 @@ There is no *hosted* web application. The pipeline is these two components plus 
 shared SQLite database on disk; an optional **local** Streamlit viewer (`viewer/`)
 lets you browse the records on demand at `localhost` (nothing is deployed).
 
+There is also a **terminal UI** (`tui-rs/`) that ties the whole pipeline together:
+launch it and, from one screen, scrape, train/load the fight-outcome model, search
+fighters, and run predictions — all driven by a long-lived Python sidecar so the
+ML model loads once.
+
+## Quick start
+
+From the repo root:
+
+```sh
+./mma          # launch the TUI (one-time optimized build on first run)
+# or, equivalently:
+make run       # same thing
+make help      # list every root task
+```
+
+Other root tasks (all run from here, no `cd` needed):
+
+```sh
+make build     # optimized TUI binary + Go scraper binary (TUI auto-detects it)
+make test      # run ALL suites: Rust (cargo) + Python (pytest) + Go (go test)
+make e2e       # end-to-end tests: PTY suite + tmux smoke (hermetic, offline)
+make train     # train / retrain the fight-outcome predictor
+```
+
+Prerequisites: Rust (`cargo`), Go, and the Python `.venv` (the TUI uses `.venv/bin/python`
+for its ML sidecar). The TUI itself is the control center — you should not need to run the
+Go scraper or Python ML by hand.
+
 ## Architecture
 
 ```
