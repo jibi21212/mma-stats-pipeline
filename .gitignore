@@ -1,6 +1,12 @@
 # Build artifacts
 scraper-go/ufcscraper.exe
 *.exe
+# Built Go scraper binary (regenerate: make build)
+scraper-go/scraper
+scraper-go/scraper-go
+scraper-go/scraper-go.bin
+# Rust TUI build output (also covered by tui-rs/.gitignore)
+tui-rs/target/
 
 # Python
 __pycache__/
@@ -21,3 +27,6 @@ ml/models/
 
 # Local-only personal study notes (not shared)
 notes/
+
+# Local Claude Code guidance (kept out of version control)
+CLAUDE.md

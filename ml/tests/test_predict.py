@@ -136,6 +136,51 @@ def test_gating_unknown_division_low_confidence():
 
 
 # --------------------------------------------------------------------------- #
+# 2b) Policy constants are the single source of truth for gating
+# --------------------------------------------------------------------------- #
+
+def test_policy_constants_have_documented_defaults():
+    # These are the EXACT values shipped to the TUI in the eligibility ``rules``.
+    assert P.MAX_DIVISION_DISTANCE == 1
+    assert P.ALLOW_CROSS_GENDER is False
+    assert P.ALLOW_UNKNOWN_DIVISION is True
+
+
+def test_eligibility_rules_sourced_from_constants():
+    # eligibility_rules() must be built FROM the constants, never re-typed, so the
+    # wire policy and the gate can never diverge.
+    assert P.eligibility_rules() == {
+        "max_distance": P.MAX_DIVISION_DISTANCE,
+        "allow_cross_gender": P.ALLOW_CROSS_GENDER,
+        "allow_unknown_division": P.ALLOW_UNKNOWN_DIVISION,
+    }
+
+
+def test_gate_matchup_uses_max_distance_constant(monkeypatch):
+    # Raising the threshold to 2 must MAKE a 2-apart matchup allowed, proving
+    # gate_matchup reads the constant rather than a hardcoded literal.
+    monkeypatch.setattr(P, "MAX_DIVISION_DISTANCE", 2)
+    res = P.gate_matchup({("M", 4)}, {("M", 6)})  # distance 2
+    assert res["allowed"] is True
+    assert res["distance"] == 2
+
+
+def test_gate_matchup_uses_allow_cross_gender_constant(monkeypatch):
+    # Flipping ALLOW_CROSS_GENDER on must permit a previously-refused cross-ladder
+    # matchup, proving the flag drives the gate.
+    monkeypatch.setattr(P, "ALLOW_CROSS_GENDER", True)
+    res = P.gate_matchup({("W", 3)}, {("M", 2)})
+    assert res["allowed"] is True
+
+
+def test_gate_matchup_uses_allow_unknown_division_constant(monkeypatch):
+    # Flipping ALLOW_UNKNOWN_DIVISION off must refuse an unknown-division matchup.
+    monkeypatch.setattr(P, "ALLOW_UNKNOWN_DIVISION", False)
+    res = P.gate_matchup(set(), {("M", 4)})
+    assert res["allowed"] is False
+
+
+# --------------------------------------------------------------------------- #
 # 3) Leakage: the as-of-date feature builder uses only fights < N
 # --------------------------------------------------------------------------- #
 

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# mma — single command to launch the MMA Stats TUI.
+#
+# Run it from the repo root (`./mma`) or by full path from anywhere. The TUI is
+# the one control center: from inside it you scrape, train/load the model, browse
+# fighters/events, and run fight predictions. You should not need to run the Go
+# scraper or Python ML directly.
+#
+# First launch does a one-time optimized build; after that it execs the cached
+# native binary, so startup is instant.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"   # so the TUI resolves the bundled data/ufc.db, .venv python, scraper
+
+BIN="$ROOT/tui-rs/target/release/mma-tui"
+if [[ -x "$BIN" ]]; then
+  exec "$BIN" "$@"
+fi
+
+exec cargo run --release --manifest-path "$ROOT/tui-rs/Cargo.toml" -- "$@"

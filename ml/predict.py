@@ -109,6 +109,77 @@ WOMEN_LADDER = {
     "Women's Featherweight": 4,
 }
 
+# Reverse lookup: (gender, ordinal) -> human-readable division name. Internally
+# divisions are carried as ``(gender, ordinal)`` tuples (see
+# ``normalize_weight_class``), but the response contract exposes ``divisions`` as
+# a list of plain NAME strings (CONTRACT.md / SCHEMA_CONTRACT.md). This map is the
+# single source of truth for that conversion.
+DIVISION_NAMES = {("M", ordinal): name for name, ordinal in MEN_LADDER.items()}
+DIVISION_NAMES.update({("W", ordinal): name for name, ordinal in WOMEN_LADDER.items()})
+
+
+# --------------------------------------------------------------------------- #
+# ELIGIBILITY POLICY CONSTANTS — the SINGLE source of truth for gating.
+# --------------------------------------------------------------------------- #
+#
+# ``gate_matchup`` (the server-side safety net) reads these, AND the sidecar's
+# ``eligibility`` command serialises THESE SAME VALUES to the TUI at startup so the
+# TUI can filter eligible opponents LOCALLY. Because both the gate and the wire
+# rules come from one place, what Python REFUSES and what it TELLS the TUI can
+# never diverge. To change policy, edit these THREE constants — nothing in Rust.
+
+#: A matchup is allowed iff the MINIMUM division distance over the shared gender
+#: ladder is <= this many steps. (Welterweight↔Middleweight = 1 step -> allowed;
+#: Lightweight↔Middleweight = 2 -> refused.)
+MAX_DIVISION_DISTANCE = 1
+
+#: Whether a matchup may cross the separate men's / women's ladders. False ->
+#: cross-gender matchups (no shared gender ladder) are refused.
+ALLOW_CROSS_GENDER = False
+
+#: Whether a fighter with NO resolvable division (only catch/open weight, or no
+#: recorded weight-class) may still be matched. True -> allowed but flagged
+#: low-confidence; False -> refused.
+ALLOW_UNKNOWN_DIVISION = True
+
+
+def eligibility_rules() -> dict:
+    """The eligibility policy as a JSON-friendly dict, sourced from the constants.
+
+    This is the EXACT ``rules`` object the sidecar's ``eligibility`` command sends
+    to the TUI at startup. It is built FROM ``MAX_DIVISION_DISTANCE`` /
+    ``ALLOW_CROSS_GENDER`` / ``ALLOW_UNKNOWN_DIVISION`` (never re-typed), so the
+    rules the TUI applies locally are guaranteed identical to the ones
+    ``gate_matchup`` enforces server-side.
+    """
+    return {
+        "max_distance": MAX_DIVISION_DISTANCE,
+        "allow_cross_gender": ALLOW_CROSS_GENDER,
+        "allow_unknown_division": ALLOW_UNKNOWN_DIVISION,
+    }
+
+
+def division_names(divisions):
+    """Convert a set of ``(gender, ordinal)`` tuples to sorted division NAMES.
+
+    Returns a sorted list of human-readable strings (e.g.
+    ``["Middleweight", "Light Heavyweight"]``), which is exactly the
+    ``divisions: Vec<String>`` shape the Rust client deserializes. Any tuple that
+    is not on a known ladder falls back to a readable ``"<gender> #<ordinal>"``
+    label so the response is always a list of strings.
+    """
+    out = []
+    for div in divisions:
+        name = DIVISION_NAMES.get(div)
+        if name is None:
+            try:
+                gender, ordinal = div
+                name = f"{gender} #{ordinal}"
+            except (TypeError, ValueError):
+                name = str(div)
+        out.append(name)
+    return sorted(out)
+
 
 def normalize_weight_class(weight_class):
     """Normalise a raw ``weight_class`` string to a canonical division.
@@ -197,27 +268,37 @@ def gate_matchup(divs_a, divs_b):
         ``allowed`` (bool), ``reason`` (str|None), ``distance`` (int|None),
         ``low_confidence`` (bool).
 
-    Rule: allowed iff A and B share a gender ladder AND the MINIMUM
-    ``|ord_a - ord_b|`` over (a in A's divs, b in B's divs on the shared ladder)
-    is <= 1. Cross-gender -> refused. A fighter with NO resolvable division
-    (only catch/open) -> allowed but flagged low confidence.
+    Rule (ALL thresholds/flags come from the module policy constants, so the gate
+    and the wire ``rules`` can never diverge): allowed iff A and B share a gender
+    ladder (unless ``ALLOW_CROSS_GENDER``) AND the MINIMUM ``|ord_a - ord_b|`` over
+    (a in A's divs, b in B's divs on the shared ladder) is
+    <= ``MAX_DIVISION_DISTANCE``. A fighter with NO resolvable division (only
+    catch/open) -> allowed (flagged low confidence) iff ``ALLOW_UNKNOWN_DIVISION``.
     """
     set_a = {d for d in divs_a if d is not None}
     set_b = {d for d in divs_b if d is not None}
 
-    # Unknown division for either side: allow but flag low confidence.
+    # Unknown division for either side: policy decides (allow + low confidence, or
+    # refuse). Driven by ALLOW_UNKNOWN_DIVISION so the TUI's local rule matches.
     if not set_a or not set_b:
+        if ALLOW_UNKNOWN_DIVISION:
+            return {
+                "allowed": True,
+                "reason": None,
+                "distance": None,
+                "low_confidence": True,
+            }
         return {
-            "allowed": True,
-            "reason": None,
+            "allowed": False,
+            "reason": "weight class unknown for one fighter (matchup not allowed)",
             "distance": None,
-            "low_confidence": True,
+            "low_confidence": False,
         }
 
     genders_a = {g for g, _ in set_a}
     genders_b = {g for g, _ in set_b}
     shared_genders = genders_a & genders_b
-    if not shared_genders:
+    if not shared_genders and not ALLOW_CROSS_GENDER:
         ga = "/".join(sorted("women" if g == "W" else "men" for g in genders_a))
         gb = "/".join(sorted("women" if g == "W" else "men" for g in genders_b))
         return {
@@ -227,7 +308,8 @@ def gate_matchup(divs_a, divs_b):
             "low_confidence": False,
         }
 
-    # Minimum division distance over the shared gender ladder(s).
+    # Minimum division distance over the shared gender ladder(s). When
+    # ALLOW_CROSS_GENDER is set and there is no shared ladder, this stays None.
     best = None
     for g in shared_genders:
         ords_a = [o for gg, o in set_a if gg == g]
@@ -238,15 +320,19 @@ def gate_matchup(divs_a, divs_b):
                 if best is None or d < best:
                     best = d
 
-    if best is not None and best <= 1:
+    if best is not None and best <= MAX_DIVISION_DISTANCE:
         return {"allowed": True, "reason": None, "distance": best, "low_confidence": False}
+
+    # Cross-gender but ALLOW_CROSS_GENDER set and no shared ladder to measure.
+    if best is None:
+        return {"allowed": True, "reason": None, "distance": None, "low_confidence": False}
 
     # Refused: too far apart. Build a readable division summary.
     return {
         "allowed": False,
         "reason": (
             f"too far apart in weight class: closest divisions are "
-            f"{best} steps apart on the ladder (need <= 1)"
+            f"{best} steps apart on the ladder (need <= {MAX_DIVISION_DISTANCE})"
         ),
         "distance": best,
         "low_confidence": False,
@@ -767,7 +853,9 @@ def _tale_of_tape(static_row, divisions):
         "recent_winrate": round(static_row.get("recent_winrate", float("nan")), 3),
         "form_delta": round(static_row.get("form_delta", float("nan")), 3),
         "layoff_days": round(static_row.get("days_since_last", float("nan")), 0),
-        "divisions": sorted(divisions),
+        # Expose divisions as human-readable NAME strings (Vec<String> on the Rust
+        # side), NOT the internal (gender, ordinal) tuples — see division_names.
+        "divisions": division_names(divisions),
     }
 
 
