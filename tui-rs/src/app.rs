@@ -19,7 +19,7 @@ use crate::db::Db;
 use crate::jobs::{self, JobKind, JobStatus, RunningJob};
 use crate::models::{
     Division, DbSummary, EligibilityRules, EventRow, FightRow, Fighter, LatestCard, PredictResult,
-    RoundStat,
+    RoundStat, WeightClass,
 };
 use std::collections::HashMap;
 use crate::scraper::ScrapeOptions;
@@ -83,7 +83,9 @@ impl Screen {
             Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · q Quit",
             Screen::FighterSearch => "type to search · ↑↓ move · ⏎ open · Esc Back · Home · q Quit",
             Screen::Fighter { .. } => "Esc Back · Home · q Quit",
-            Screen::Predict => "type · ↑↓ pick · ⏎ choose · ←→ slot · Esc Back · Home · q Quit",
+            Screen::Predict => {
+                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ weight class · Esc Back · Home · q Quit"
+            }
             Screen::Model => "t train · l reload · r refresh · Esc Back · Home · q Quit",
         }
     }
@@ -147,6 +149,13 @@ pub enum PredictSlot {
 pub struct PredictState {
     /// Slot currently being edited / picked.
     pub slot: PredictSlot,
+    /// Selected weight-class filter, as an index into the fetched
+    /// `eligibility.weight_classes`. `None` = "All weight classes" (no filter, the
+    /// original behaviour). When `Some(i)`, the candidate POOL for BOTH slots is
+    /// restricted to fighters who fought in `weight_classes[i]` (composing with the
+    /// eligibility rules on slot B). The index — never a class name — is stored, so
+    /// nothing about the ladder is hardcoded here.
+    pub weight_class: Option<usize>,
     /// Chosen fighter A (None until picked).
     pub name_a: Option<String>,
     /// Chosen fighter B (None until picked).
@@ -225,6 +234,11 @@ pub struct EligibilityState {
     pub rules: Option<EligibilityRules>,
     /// `fighter name -> the (gender, ordinal) divisions they have fought in`.
     pub divisions: HashMap<String, Vec<Division>>,
+    /// The full weight-class ladder shipped by Python (men ascending then women
+    /// ascending). The Predict screen's class picker is built ENTIRELY from this —
+    /// no class names/ordinals are hardcoded in Rust. Empty until fetched / when no
+    /// model is loaded (the picker then offers only "All weight classes").
+    pub weight_classes: Vec<WeightClass>,
 }
 
 impl EligibilityState {
@@ -251,6 +265,56 @@ impl EligibilityState {
             .collect();
         out.sort();
         out
+    }
+
+    /// Whether fighter `name` "is in" weight class `wc` — i.e. the divisions they
+    /// have fought in contain the class's `(gender, ordinal)` identity (the
+    /// MEMBERSHIP CONTRACT, applied via [`crate::models::fighter_in_class`]). A
+    /// fighter with no cached divisions is in no class.
+    pub fn fighter_in_class(&self, name: &str, wc: &WeightClass) -> bool {
+        let empty: Vec<Division> = Vec::new();
+        let divs = self.divisions.get(name).unwrap_or(&empty);
+        crate::models::fighter_in_class(divs, wc)
+    }
+
+    /// The subset of `roster` whose fighters fought in weight class `wc`, in the
+    /// roster's given order. PURE; membership derives entirely from the fetched
+    /// `divisions` + the class identity (no hardcoded names/ordinals).
+    pub fn in_class(&self, wc: &WeightClass, roster: &[String]) -> Vec<String> {
+        roster
+            .iter()
+            .filter(|n| self.fighter_in_class(n, wc))
+            .cloned()
+            .collect()
+    }
+
+    /// COMPOSE the eligibility gate with the weight-class filter into one candidate
+    /// pool. PURE core of the Predict screen's pool computation (the `App` wrapper
+    /// just resolves `other` from the focused slot and the class from the selected
+    /// index):
+    ///   * base pool = `eligible_opponents(other)` when `other` is `Some` (the
+    ///     symmetric gate, excludes `other`), else the full `roster`;
+    ///   * then narrowed to `class` (fighters in that class) when `Some`, or left
+    ///     as-is for "All weight classes" (`None`).
+    ///
+    /// So the result is `in-class AND eligible(other, b, rules)`.
+    pub fn compose_pool(
+        &self,
+        other: Option<&str>,
+        class: Option<&WeightClass>,
+        roster: &[String],
+    ) -> Vec<String> {
+        let base = match other {
+            Some(name) => self.eligible_opponents(name, roster),
+            None => roster.to_vec(),
+        };
+        match class {
+            Some(wc) => base
+                .into_iter()
+                .filter(|n| self.fighter_in_class(n, wc))
+                .collect(),
+            None => base,
+        }
     }
 }
 
@@ -472,9 +536,17 @@ impl App {
             Ok(payload) => {
                 self.eligibility.rules = Some(payload.rules);
                 self.eligibility.divisions = payload.divisions;
+                self.eligibility.weight_classes = payload.weight_classes;
+                // A re-fetch can shrink/reorder the ladder; drop a now-invalid index.
+                if let Some(i) = self.predict.weight_class
+                    && i >= self.eligibility.weight_classes.len()
+                {
+                    self.predict.weight_class = None;
+                }
             }
             Err(e) => {
                 self.eligibility = EligibilityState::default();
+                self.predict.weight_class = None;
                 self.status_line = Some(format!("Eligibility policy unavailable: {e}"));
             }
         }
@@ -839,6 +911,12 @@ impl App {
 
     fn on_key_predict(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
+            KeyCode::Tab => {
+                self.cycle_weight_class(1);
+            }
+            KeyCode::BackTab => {
+                self.cycle_weight_class(-1);
+            }
             KeyCode::Left | KeyCode::Right => {
                 self.predict.toggle_slot();
                 // The focused slot changed, so its pool now depends on the OTHER
@@ -877,13 +955,15 @@ impl App {
     }
 
     /// After committing `just_committed` in the focused slot, check the OTHER
-    /// slot: if it holds a pick that the new policy no longer allows, clear it.
+    /// slot: if it holds a pick that is no longer in the composed candidate pool,
+    /// clear it.
     ///
-    /// Covers the re-pick case — both slots filled, then the user changes one to
-    /// a fighter that makes the existing opponent ineligible. The gate is
-    /// symmetric, so the other slot is valid iff it appears in the LOCAL
-    /// `eligible_opponents(just_committed)` (computed from the startup-fetched
-    /// policy + divisions — no IPC).
+    /// Covers the re-pick case — both slots filled, then the user changes one to a
+    /// fighter that makes the existing opponent ineligible. The composed pool is
+    /// symmetric (the gate is symmetric and the class filter is the same for both
+    /// slots), so the other slot is valid iff it appears in
+    /// `predict_pool_for(just_committed)` (eligible vs `just_committed` AND in the
+    /// selected class — computed locally, no IPC).
     fn validate_other_slot(&mut self, just_committed: &str) {
         let other = match self.predict.slot.other() {
             PredictSlot::A => self.predict.name_a.clone(),
@@ -891,11 +971,9 @@ impl App {
         };
         let Some(other_name) = other else { return };
 
-        let eligible = self
-            .eligibility
-            .eligible_opponents(just_committed, &self.roster);
+        let pool = self.predict_pool_for(Some(just_committed));
 
-        if !eligible.iter().any(|n| n == &other_name) {
+        if !pool.iter().any(|n| n == &other_name) {
             match self.predict.slot.other() {
                 PredictSlot::A => self.predict.name_a = None,
                 PredictSlot::B => self.predict.name_b = None,
@@ -903,7 +981,7 @@ impl App {
             self.predict.result = None;
             self.predict.error = None;
             self.status_line = Some(format!(
-                "{other_name} is no longer an eligible opponent — pick cleared."
+                "{other_name} is no longer in the candidate pool — pick cleared."
             ));
         }
     }
@@ -911,28 +989,88 @@ impl App {
     /// Recompute the FOCUSED slot's candidate pool and clear any now-ineligible
     /// pick in the FOCUSED slot.
     ///
-    /// The pool is the OTHER slot's eligible opponents (computed LOCALLY from the
-    /// startup-fetched eligibility policy + divisions) when that slot holds a pick,
-    /// else the full roster. Because the gate is symmetric, the OTHER slot's
-    /// eligible set is exactly the set of fighters allowed in the focused slot. If
-    /// the focused slot itself already holds a pick that is no longer in the pool,
-    /// that pick is cleared so an ineligible matchup can never persist.
+    /// The pool COMPOSES two filters:
+    ///   1. the OTHER slot's eligible opponents (computed LOCALLY from the
+    ///      startup-fetched eligibility policy + divisions) when that slot holds a
+    ///      pick, else the full roster — the symmetric eligibility gate, and
+    ///   2. the selected WEIGHT-CLASS filter (fighters who fought in the chosen
+    ///      class), or no class filter when "All weight classes" is selected.
+    ///
+    /// So `pool = in-class AND eligible(other, b, rules)`. If the focused slot
+    /// itself already holds a pick that is no longer in the pool (the other slot's
+    /// choice OR a new class selection dropped it), that pick is cleared so an
+    /// ineligible / out-of-class matchup can never persist.
     fn refresh_predict_pool(&mut self) {
         // The name committed in the slot OPPOSITE the one currently focused; it
         // constrains the focused slot's eligible opponents.
         let other = self.predict.other_committed().map(str::to_string);
-
-        let pool = match other {
-            Some(name) => self.eligibility.eligible_opponents(&name, &self.roster),
-            None => self.roster.clone(),
-        };
+        let pool = self.predict_pool_for(other.as_deref());
 
         let dropped = self.predict.set_pool(pool);
         if let Some(name) = dropped {
             self.status_line = Some(format!(
-                "{name} is no longer an eligible opponent — pick cleared."
+                "{name} is no longer in the candidate pool — pick cleared."
             ));
         }
+    }
+
+    /// PURE: the candidate pool for a slot whose OPPOSITE slot holds `other` (or
+    /// `None` when empty), composing the eligibility gate with the selected
+    /// weight-class filter. Used by [`Self::refresh_predict_pool`] and unit-tested
+    /// directly. The base pool is `eligible_opponents(other)` when `other` is set
+    /// (symmetric gate), else the full roster; it is THEN narrowed to the selected
+    /// class (no-op for "All"). NOTHING about the ladder is hardcoded — the class
+    /// is looked up by index in the fetched `weight_classes`.
+    pub fn predict_pool_for(&self, other: Option<&str>) -> Vec<String> {
+        self.eligibility
+            .compose_pool(other, self.selected_weight_class(), &self.roster)
+    }
+
+    /// The currently-selected [`WeightClass`], or `None` for "All weight classes"
+    /// (or when the cached index no longer maps to a class). Resolved by index into
+    /// the fetched ladder, so the selection survives only as long as that ladder.
+    pub fn selected_weight_class(&self) -> Option<&WeightClass> {
+        self.predict
+            .weight_class
+            .and_then(|i| self.eligibility.weight_classes.get(i))
+    }
+
+    /// Change the weight-class filter by `dir` (+1 forward / -1 back) over
+    /// `[All, ...fetched classes]`, then re-apply the filter: drop any committed
+    /// pick (in EITHER slot) that is no longer in the newly-selected class, and
+    /// recompute the focused slot's pool + ranked candidates. The class filter is
+    /// the SAME for both slots, so a class change can invalidate either pick.
+    fn cycle_weight_class(&mut self, dir: i32) {
+        let n = self.eligibility.weight_classes.len();
+        self.predict.cycle_weight_class(dir, n);
+
+        // Drop any committed pick that falls out of the newly-selected class. The
+        // class filter applies to BOTH slots independently of the eligibility gate.
+        if let Some(wc) = self.selected_weight_class().cloned() {
+            if let Some(a) = self.predict.name_a.clone()
+                && !self.eligibility.fighter_in_class(&a, &wc)
+            {
+                self.predict.name_a = None;
+                self.predict.result = None;
+                self.predict.error = None;
+            }
+            if let Some(b) = self.predict.name_b.clone()
+                && !self.eligibility.fighter_in_class(&b, &wc)
+            {
+                self.predict.name_b = None;
+                self.predict.result = None;
+                self.predict.error = None;
+            }
+        }
+
+        let label = match self.selected_weight_class() {
+            Some(wc) => wc.name.clone(),
+            None => "All weight classes".to_string(),
+        };
+        self.status_line = Some(format!("Weight class: {label}."));
+
+        self.refresh_predict_pool();
+        self.recompute_predict_candidates();
     }
 
     fn recompute_predict_candidates(&mut self) {
@@ -1189,6 +1327,34 @@ impl PredictState {
             self.query.clear();
             self.selected = 0;
         }
+    }
+
+    /// Cycle the weight-class selection by `dir` (+1 forward / -1 back) over the
+    /// sequence `[All, class_0, class_1, ..., class_{n-1}]` (so `n + 1` options),
+    /// where `n` is the number of fetched classes. `None` is "All weight classes".
+    /// PURE: mutates only the index and resets the live query/highlight (the focused
+    /// slot reverts to fresh picking under the new filter); the caller re-filters the
+    /// pools + clears any out-of-class picks. With no classes fetched this is a no-op
+    /// (only "All" exists).
+    pub fn cycle_weight_class(&mut self, dir: i32, n_classes: usize) {
+        if n_classes == 0 {
+            self.weight_class = None;
+            return;
+        }
+        let total = n_classes as i64 + 1; // +1 for the "All" sentinel
+        // Map current selection to a position: 0 = All, i+1 = class i.
+        let cur = match self.weight_class {
+            None => 0i64,
+            Some(i) => i as i64 + 1,
+        };
+        let next = (cur + dir as i64).rem_euclid(total);
+        self.weight_class = if next == 0 {
+            None
+        } else {
+            Some((next - 1) as usize)
+        };
+        self.query.clear();
+        self.selected = 0;
     }
 
     pub fn both_selected(&self) -> bool {
@@ -1529,6 +1695,167 @@ mod tests {
         assert_eq!(dropped, None);
         assert_eq!(p.name_a, None);
         assert_eq!(p.pool, names(&["X", "Y", "Z"]));
+    }
+
+    // ----------------------------------------------------------------------- //
+    // WEIGHT-CLASS FILTER (membership, compose with eligibility, cycling)
+    // ----------------------------------------------------------------------- //
+
+    use crate::models::{Gender, WeightClass};
+
+    fn div(g: &str, o: i32) -> Division {
+        Division(g.to_string(), o)
+    }
+
+    fn wc(name: &str, g: Gender, o: i32) -> WeightClass {
+        WeightClass {
+            name: name.to_string(),
+            gender: g,
+            ordinal: o,
+        }
+    }
+
+    /// The canned stub-shaped eligibility cache: Pereira at Heavyweight (M#8),
+    /// Adesanya + Whittaker at Middleweight (M#6), max_distance 1, two classes.
+    fn stub_eligibility() -> EligibilityState {
+        let mut divisions = HashMap::new();
+        divisions.insert("Alex Pereira".to_string(), vec![div("M", 8)]);
+        divisions.insert("Israel Adesanya".to_string(), vec![div("M", 6)]);
+        divisions.insert("Robert Whittaker".to_string(), vec![div("M", 6)]);
+        EligibilityState {
+            rules: Some(EligibilityRules {
+                max_distance: 1,
+                allow_cross_gender: false,
+                allow_unknown_division: true,
+            }),
+            divisions,
+            weight_classes: vec![
+                wc("Middleweight", Gender::Men, 6),
+                wc("Heavyweight", Gender::Men, 8),
+            ],
+        }
+    }
+
+    #[test]
+    fn in_class_filters_roster_by_membership() {
+        let elig = stub_eligibility();
+        let roster = names(&["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]);
+
+        // Middleweight (M#6) -> Adesanya + Whittaker (NOT Pereira).
+        let mw = wc("Middleweight", Gender::Men, 6);
+        assert_eq!(
+            elig.in_class(&mw, &roster),
+            names(&["Israel Adesanya", "Robert Whittaker"])
+        );
+        // Heavyweight (M#8) -> only Pereira.
+        let hw = wc("Heavyweight", Gender::Men, 8);
+        assert_eq!(elig.in_class(&hw, &roster), names(&["Alex Pereira"]));
+    }
+
+    #[test]
+    fn compose_pool_all_classes_is_pure_eligibility() {
+        let elig = stub_eligibility();
+        let roster = names(&["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]);
+
+        // No class filter, no other slot -> the whole roster (current behaviour).
+        assert_eq!(elig.compose_pool(None, None, &roster), roster);
+
+        // No class filter, slot A = Adesanya -> eligible opponents only:
+        // Whittaker (M#6, dist 0) stays; Pereira (M#8, dist 2 > 1) is gated out.
+        assert_eq!(
+            elig.compose_pool(Some("Israel Adesanya"), None, &roster),
+            names(&["Robert Whittaker"])
+        );
+    }
+
+    #[test]
+    fn compose_pool_narrows_slot_a_by_selected_class() {
+        let elig = stub_eligibility();
+        let roster = names(&["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]);
+
+        // Slot A pool (no other slot) restricted to Middleweight: Pereira dropped.
+        let mw = wc("Middleweight", Gender::Men, 6);
+        assert_eq!(
+            elig.compose_pool(None, Some(&mw), &roster),
+            names(&["Israel Adesanya", "Robert Whittaker"])
+        );
+        // Restricted to Heavyweight: only Pereira.
+        let hw = wc("Heavyweight", Gender::Men, 8);
+        assert_eq!(
+            elig.compose_pool(None, Some(&hw), &roster),
+            names(&["Alex Pereira"])
+        );
+    }
+
+    #[test]
+    fn compose_pool_composes_class_filter_with_eligibility_on_slot_b() {
+        let elig = stub_eligibility();
+        let roster = names(&["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]);
+        let mw = wc("Middleweight", Gender::Men, 6);
+        let hw = wc("Heavyweight", Gender::Men, 8);
+
+        // Slot A = Adesanya, class = Middleweight: pool is eligible-vs-Adesanya
+        // (Whittaker) AND in Middleweight (Whittaker) -> [Whittaker].
+        assert_eq!(
+            elig.compose_pool(Some("Israel Adesanya"), Some(&mw), &roster),
+            names(&["Robert Whittaker"])
+        );
+
+        // Slot A = Adesanya, class = Heavyweight: the only Heavyweight is Pereira,
+        // but Pereira is INELIGIBLE vs Adesanya -> pool is EMPTY (compose, not OR).
+        assert_eq!(
+            elig.compose_pool(Some("Israel Adesanya"), Some(&hw), &roster),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn cycle_weight_class_walks_all_then_each_class_and_wraps() {
+        let mut p = PredictState::default();
+        let n = 2; // [All, class0, class1]
+
+        // Start at All (None).
+        assert_eq!(p.weight_class, None);
+        // Forward: None -> class0 -> class1 -> None ...
+        p.cycle_weight_class(1, n);
+        assert_eq!(p.weight_class, Some(0));
+        p.cycle_weight_class(1, n);
+        assert_eq!(p.weight_class, Some(1));
+        p.cycle_weight_class(1, n);
+        assert_eq!(p.weight_class, None);
+
+        // Backward from All wraps to the LAST class.
+        p.cycle_weight_class(-1, n);
+        assert_eq!(p.weight_class, Some(1));
+        p.cycle_weight_class(-1, n);
+        assert_eq!(p.weight_class, Some(0));
+        p.cycle_weight_class(-1, n);
+        assert_eq!(p.weight_class, None);
+    }
+
+    #[test]
+    fn cycle_weight_class_is_noop_without_fetched_classes() {
+        let mut p = PredictState {
+            weight_class: None,
+            query: "search".into(),
+            selected: 2,
+            ..Default::default()
+        };
+        p.cycle_weight_class(1, 0);
+        assert_eq!(p.weight_class, None);
+    }
+
+    #[test]
+    fn cycle_weight_class_resets_query_and_highlight() {
+        let mut p = PredictState {
+            query: "ades".into(),
+            selected: 3,
+            ..Default::default()
+        };
+        p.cycle_weight_class(1, 2);
+        assert_eq!(p.weight_class, Some(0));
+        assert_eq!(p.query, "");
+        assert_eq!(p.selected, 0);
     }
 
     // ----------------------------------------------------------------------- //

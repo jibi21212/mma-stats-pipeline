@@ -16,6 +16,76 @@ launch it and, from one screen, scrape, train/load the fight-outcome model, sear
 fighters, and run predictions — all driven by a long-lived Python sidecar so the
 ML model loads once.
 
+## Install
+
+Install the whole polyglot app (Go scraper + Python ML + Rust TUI) with a single
+command and launch it with `mma`. Both methods **build from source**, so the
+build toolchains below are required. Both also install into a **user-writable
+location** because the Go scraper is the sole writer of the database.
+
+**Prerequisites (build-from-source):**
+
+- **Rust** (`cargo`) — builds the TUI
+- **Go** — builds the scraper
+- **Python 3** — runs the ML sidecar (a virtualenv is created for you)
+- **git** — only for the `curl | sh` method (clones the repo)
+
+On macOS the easiest way to get all of them is Homebrew:
+`brew install git python rust go`. The installers also detect missing toolchains
+and print copy-paste instructions.
+
+### Option A — Homebrew (macOS)
+
+```sh
+brew tap jibi21212/tap
+brew install mma-stats
+mma
+```
+
+`go` and `rust` are pulled in automatically as build dependencies and `python`
+as a runtime dependency. On **first run**, `mma` provisions a user-writable
+runtime directory at `${XDG_DATA_HOME:-$HOME/.local/share}/mma-stats` — a Python
+venv with the ML dependencies plus a writable copy of the bundled database — then
+launches the TUI. That one-time step uses the network (Homebrew's build sandbox
+can't), so it happens at first launch, not during `brew install`. Later launches
+are instant.
+
+> Status: the tap (`jibi21212/homebrew-tap`) and a public release of this repo
+> must exist for these commands to resolve. The formula and a tap scaffold live
+> in [`packaging/homebrew/`](packaging/homebrew/); see its README for publishing
+> steps and the current honest status.
+
+### Option B — curl | sh (macOS / Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jibi21212/mma-stats-pipeline/main/install.sh | sh
+```
+
+This clones the repo into a writable location
+(`~/.local/share/mma-stats-pipeline` by default; override with `$MMA_HOME`), runs
+the build-from-source setup (`scripts/setup.sh`: Python venv + ML deps + native
+binaries), and symlinks the `mma` launcher into `~/.local/bin`. If that directory
+isn't on your `PATH`, the installer tells you the exact line to add. Re-running
+updates the install (`git pull` + incremental rebuild). Then:
+
+```sh
+mma
+```
+
+### Option C — from a clone (development)
+
+Clone the repo and run the launcher; it self-bootstraps the build on first run:
+
+```sh
+git clone https://github.com/jibi21212/mma-stats-pipeline.git
+cd mma-stats-pipeline
+./mma          # first run builds from source, then launches
+```
+
+Or run the setup explicitly (`scripts/setup.sh --install-deps` will `brew
+install` any missing toolchains on macOS). See [Quick start](#quick-start) below
+for the full set of `make` tasks.
+
 ## Quick start
 
 From the repo root:

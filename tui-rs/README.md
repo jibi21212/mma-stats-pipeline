@@ -23,6 +23,30 @@ builds are fast.)
   math lives in Python; the TUI never reimplements it.
 - **Runs** the Go scraper on demand and streams its progress into a log pane.
 
+## Loading animation (terminal graphics)
+
+While a background job (scrape / train) is running, the loading overlay plays a
+two-fighter boxing choreography. It renders in one of two ways, chosen
+automatically at startup:
+
+- **Real pixel images** — on graphics-capable terminals (iTerm2, WezTerm,
+  Ghostty, kitty, or any Sixel terminal) the fighter sprite is drawn as a true
+  image via the [`ratatui-image`](https://crates.io/crates/ratatui-image) crate.
+- **Sextant cell-art fallback** — on terminals without a graphics protocol
+  (Apple Terminal, Alacritty, the VS Code integrated terminal, or a PTY under
+  test) the same sprite is rasterized to Unicode "Symbols for Legacy Computing"
+  sextant blocks (a 2×3 sub-pixel grid per cell).
+
+Notes:
+
+- **tmux**: the graphics protocol only reaches the outer terminal if passthrough
+  is enabled. Add `set -g allow-passthrough on` to your `~/.tmux.conf`.
+- **Detection is conservative.** The capability probe is only run on terminals
+  known to answer it (to avoid a blocking stdin query stealing keystrokes on
+  non-responding terminals). Force it on/off with `MMA_TUI_GFX=1` / `MMA_TUI_GFX=0`.
+- The VS Code terminal (`TERM_PROGRAM=vscode`) has no graphics protocol, so the
+  real-image path cannot be verified there — it shows the sextant fallback.
+
 ## Configuration
 
 Resolved automatically at startup (see `src/config.rs`):
@@ -49,6 +73,8 @@ train one (training writes `ml/models/predictor.joblib`).
 | `src/stats_text.rs` | Plain-English stat explanations (the "layman layer").       |
 | `src/fuzzy.rs`      | Fuzzy fighter-name narrowing.                               |
 | `src/app.rs`        | App state + screens + update/transition logic.              |
+| `src/anim.rs`       | Pure animation generators: fighter sprite (RGBA + sextant), spinner, intro. |
+| `src/sprites.rs`    | Terminal-graphics detection + pre-encoded real-image fighter frames. |
 | `src/ui/`           | Per-screen renderers + top-level `draw`.                    |
 | `src/main.rs`       | Terminal setup + event loop.                                |
 

@@ -32,17 +32,28 @@ Payloads:
     eligibility-> {"ok":true,
                    "rules":{"max_distance":1,"allow_cross_gender":false,
                             "allow_unknown_division":true},
-                   "divisions":{"<fighter>":[["M",6],["M",7]], ...}}
+                   "divisions":{"<fighter>":[["M",6],["M",7]], ...},
+                   "weight_classes":[{"name":"Flyweight","gender":"M",
+                                      "ordinal":1}, ...,
+                                     {"name":"Women's Strawweight","gender":"W",
+                                      "ordinal":1}, ...]}
                   The TUI calls this exactly ONCE at startup. ``rules`` is the
                   eligibility POLICY, serialised straight from the predict.py
                   constants (MAX_DIVISION_DISTANCE / ALLOW_CROSS_GENDER /
                   ALLOW_UNKNOWN_DIVISION). ``divisions`` maps each fighter to a
                   list of [gender "M"|"W", ordinal int] pairs (empty list if none
-                  resolvable), from the model payload's ``divisions``. The TUI
+                  resolvable), from the model payload's ``divisions``.
+                  ``weight_classes`` is the full ladder (predict.weight_class_ladder(),
+                  built FROM MEN_LADDER + WOMEN_LADDER): a list of
+                  {"name","gender","ordinal"} dicts. A fighter "is in" a class C iff
+                  their ``divisions`` contain [C.gender, C.ordinal], so the TUI can
+                  offer a weight-class picker and filter the candidate pool to those
+                  who fought in the chosen class -- composing with ``rules``. The TUI
                   then filters eligible opponents LOCALLY for every slot selection
-                  (like fuzzy search) -- ZERO per-selection round-trips. The
-                  ladder definitions live ONLY here in Python; Rust only ever
-                  compares the ordinals it was handed against ``rules``.
+                  (like fuzzy search) -- ZERO per-selection round-trips. The ladder
+                  definitions (names + ordinals) live ONLY here in Python; Rust only
+                  ever compares the ordinals it was handed against ``rules`` and the
+                  (gender, ordinal) identities in ``weight_classes``.
                   (ok:false "model not trained" when no model is loaded.)
     predict    -> {"ok":true,"result":{...predict() dict, NaN/Inf -> null...}}
                   (ok:false if no model / unknown fighter)
@@ -256,15 +267,19 @@ def handle(request: dict, state: State) -> dict:
         return ok({"ok": True, "fighters": list(state.roster)})
 
     if cmd == "eligibility":
-        # The eligibility POLICY + per-fighter division metadata, fetched ONCE at
-        # startup by the TUI so it can filter eligible opponents LOCALLY (like
-        # fuzzy search) -- ZERO per-selection round-trips. ``rules`` is sourced
-        # from the predict.py policy constants (so what Python GATES and what it
-        # TELLS the TUI can never diverge); ``divisions`` is the persisted
-        # {name -> set of (gender, ordinal)} map serialised to
-        # {name: [[gender, ord]]} (empty list when no resolvable division). The
-        # TUI applies ``rules`` to those ordinals exactly as gate_matchup does;
-        # the real weight-string parsing + the ladder definitions stay here.
+        # The eligibility POLICY + per-fighter division metadata + the weight-class
+        # ladder, fetched ONCE at startup by the TUI so it can filter eligible
+        # opponents LOCALLY (like fuzzy search) -- ZERO per-selection round-trips.
+        # ``rules`` is sourced from the predict.py policy constants (so what Python
+        # GATES and what it TELLS the TUI can never diverge); ``divisions`` is the
+        # persisted {name -> set of (gender, ordinal)} map serialised to
+        # {name: [[gender, ord]]} (empty list when no resolvable division);
+        # ``weight_classes`` is predict.weight_class_ladder() (built FROM the
+        # MEN_LADDER + WOMEN_LADDER constants), the single source for the TUI's
+        # weight-class picker -- a fighter "is in" a class iff its [gender, ordinal]
+        # appears in that fighter's ``divisions``. The TUI applies ``rules`` to
+        # those ordinals exactly as gate_matchup does; the real weight-string
+        # parsing + the ladder definitions (names + ordinals) stay here.
         if not state.model_loaded:
             return err(_MODEL_NOT_TRAINED)
         divs = _divisions_payload(state)
@@ -272,6 +287,7 @@ def handle(request: dict, state: State) -> dict:
             "ok": True,
             "rules": predict.eligibility_rules(),
             "divisions": divs,
+            "weight_classes": predict.weight_class_ladder(),
         })
 
     if cmd == "predict":

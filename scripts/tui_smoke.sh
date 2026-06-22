@@ -18,8 +18,8 @@
 #     FOOTER shows the contextual controls.
 #   * DATABASE is a hub with two paths: "Browse events" and "Find a fighter".
 #   * Scrape runs ASYNC on a background thread and streams into a loading overlay
-#     (ASCII fighters + a braille spinner + a progress bar + the live log) while
-#     the event loop keeps ticking — it never freezes.
+#     (a braille spinner + a progress bar + the live log) while the event loop
+#     keeps ticking — it never freezes.
 #
 # HOW IT STAYS HERMETIC / OFFLINE
 #   * A tiny fixture SQLite DB is built in a tempdir via the sqlite3 CLI (the 4
@@ -57,8 +57,8 @@
 #                             probability pane, and a tale row with record "24-3".
 #   (4) Scrape no-freeze   -> Home, Enter into Scrape; assert "Full: OFF"; press
 #                             f -> "Full: ON"; Enter to run; assert the running
-#                             overlay streams "saved event 1/3" AND the animation
-#                             frame CHANGES between two captures (loop not frozen)
+#                             overlay streams "saved event 1/3" AND the braille
+#                             SPINNER glyph CHANGES across samples (loop not frozen)
 #                             AND a completion line "Scraping finished OK".
 #   (5) Quit               -> Home, q, assert the tmux session is gone.
 # =============================================================================
@@ -126,18 +126,21 @@ assert_not_contains() {
     fi
 }
 
-# overlay_fighters : dump just the loading overlay's two-fighter animation body
-# (the rows of the "Scraping" panel, before the Status/Progress/Output panels),
-# with box-drawing frame chars stripped, so two captures differ ONLY when the
-# pose actually changes. Used to prove the event loop keeps ticking (no freeze).
-overlay_fighters() {
+# overlay_spinner : extract the loading overlay's live braille SPINNER glyph from
+# the rendered "Status" panel (the head reads e.g. "⠋ Scraping…  running  3s" while
+# running). Prints the single spinner glyph, or nothing if none is on screen (the
+# overlay isn't up, or the job finished and the spinner froze to a static "✓").
+# Used to prove the event loop keeps ticking (no freeze): the glyph must advance.
+overlay_spinner() {
     screen | awk '
-        /Scraping/ { grab=1; next }
-        grab && (/Status/ || /Progress/ || /Output/) { exit }
+        /Status/ { grab=1 }
+        grab && /Output \(/ { exit }
         grab {
-            gsub(/[│┌┐└┘─]/, "")
-            gsub(/^[ \t]+|[ \t]+$/, "")
-            if (length($0) > 0) print
+            # Print the first known braille spinner glyph on the line, if any.
+            n = split("⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏", g, " ")
+            for (i = 1; i <= n; i++) {
+                if (index($0, g[i]) > 0) { print g[i]; exit }
+            }
         }
     '
 }
@@ -451,8 +454,8 @@ assert_not_contains "cross-"
 #
 # Home, Enter into Scrape; assert the "Full: OFF" chip and that f flips it ON;
 # Enter runs the (stub) scraper. WHILE it runs we prove the loop is NOT frozen:
-# a mid-run progress line streams in AND the two-fighter animation frame CHANGES
-# between two captures. Finally the app's own completion marker appears.
+# a mid-run progress line streams in AND the braille SPINNER glyph CHANGES across
+# repeated samples. Finally the app's own completion marker appears.
 # --------------------------------------------------------------------------- #
 echo "[smoke] step 4: scrape streams without freezing"
 tmux send-keys -t "$SES" Home
@@ -475,14 +478,33 @@ assert_contains "running"
 wait_for "saved event 1/3"
 assert_contains "saved event 1/3"
 
-# NO-FREEZE PROOF: the fighters animation advances between two captures (~0.4s
-# apart). The event loop must keep ticking while the background job streams.
-FRAME_A="$(overlay_fighters)"
-sleep 0.4
-FRAME_B="$(overlay_fighters)"
-[ -n "$FRAME_A" ] || fail "loading overlay animation panel was empty while running"
-if [ "$FRAME_A" = "$FRAME_B" ]; then
-    fail "fighters animation did not advance between captures (event loop frozen?)"
+# NO-FREEZE PROOF: the braille spinner advances while the job runs. The overlay's
+# only motion is the spinner, which the still-ticking event loop re-renders every
+# frame. We SAMPLE the live glyph repeatedly across a window and require it to take
+# on MORE THAN ONE distinct value — a frozen loop can only ever render a single
+# glyph, so >1 distinct glyph is exactly the liveness signal (and sampling many
+# times, rather than diffing two fixed captures, is immune to braille-cycle
+# aliasing + scheduling jitter).
+SAW_SPINNER=""
+DISTINCT_SPINNERS=""
+for _ in $(seq 1 15); do
+    g="$(overlay_spinner)"
+    if [ -n "$g" ]; then
+        SAW_SPINNER="yes"
+        case " $DISTINCT_SPINNERS " in
+            *" $g "*) : ;;
+            *) DISTINCT_SPINNERS="$DISTINCT_SPINNERS $g" ;;
+        esac
+    fi
+    # Stop early once we've observed two distinct glyphs.
+    set -- $DISTINCT_SPINNERS
+    [ "$#" -ge 2 ] && break
+    sleep 0.1
+done
+[ -n "$SAW_SPINNER" ] || fail "loading overlay had no braille spinner glyph while running"
+set -- $DISTINCT_SPINNERS
+if [ "$#" -lt 2 ]; then
+    fail "braille spinner did not advance while running (event loop frozen?); saw:$DISTINCT_SPINNERS"
 fi
 
 # Completion: the app appends "$ Scraping finished OK" after the job exits OK.

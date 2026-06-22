@@ -35,17 +35,65 @@ const ACCENT_B: Color = Color::Red;
 
 /// Render the Predict screen into `area`.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    // pickers (fixed) | VS banner (fixed) | output (rest)
-    let [pickers, banner, output] = Layout::vertical([
+    // class selector (fixed) | pickers (fixed) | VS banner (fixed) | output (rest)
+    let [class, pickers, banner, output] = Layout::vertical([
+        Constraint::Length(3),
         Constraint::Length(11),
         Constraint::Length(3),
         Constraint::Min(0),
     ])
     .areas(area);
 
+    render_class_selector(frame, class, app);
     render_pickers(frame, pickers, app);
     render_banner(frame, banner, app);
     render_output(frame, output, app);
+}
+
+// --------------------------------------------------------------------------- //
+// WEIGHT-CLASS SELECTOR
+// --------------------------------------------------------------------------- //
+
+/// A single-line chip row: "All weight classes" followed by each fetched class
+/// name, with the active selection highlighted. The classes come ENTIRELY from
+/// the sidecar-fetched `eligibility.weight_classes` (no names hardcoded here);
+/// when none were fetched only "All weight classes" shows. ⇥ cycles the chips
+/// (see the footer); the fighter pickers below reflect the active filter.
+fn render_class_selector(frame: &mut Frame, area: Rect, app: &App) {
+    let selected = app.predict.weight_class; // None = "All weight classes"
+
+    // Highlight style for the active chip; dim for the rest.
+    let on = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let off = Style::default().fg(Color::Gray);
+
+    let mut spans: Vec<Span> = Vec::new();
+    // The "All" chip (no filter).
+    spans.push(Span::styled(
+        " All weight classes ",
+        if selected.is_none() { on } else { off },
+    ));
+    for (i, wc) in app.eligibility.weight_classes.iter().enumerate() {
+        // Member count for the chip, derived from the fetched divisions (no
+        // hardcoded membership): how many roster fighters fought in this class.
+        let count = app.eligibility.in_class(wc, &app.roster).len();
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} ({count}) ", wc.name),
+            if selected == Some(i) { on } else { off },
+        ));
+    }
+
+    let title = match app.selected_weight_class() {
+        Some(wc) => format!("Weight class — {} (⇥ change)", wc.name),
+        None => "Weight class — All (⇥ change)".to_string(),
+    };
+    let p = Paragraph::new(Line::from(spans))
+        .block(titled_block(&title))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(p, area);
 }
 
 // --------------------------------------------------------------------------- //

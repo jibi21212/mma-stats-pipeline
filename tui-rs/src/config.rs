@@ -159,6 +159,16 @@ impl Config {
         Config::resolve(repo_root, &EnvVars::from_process())
     }
 
+    /// The DEFAULT DB path for this config's repo root: `<repo>/data/ufc.db`.
+    ///
+    /// Used to decide whether the resolved [`db_path`](Self::db_path) was
+    /// overridden (e.g. via `$MMA_DB` or an installed/writable copy). When the
+    /// active `db_path` differs from this default, the scraper is told where to
+    /// write via `--db`; see `src/scraper.rs`.
+    pub fn default_db_path(&self) -> PathBuf {
+        self.repo_root.join("data").join("ufc.db")
+    }
+
     /// PURE resolver: build a `Config` from a repo root plus an explicit
     /// [`EnvVars`] snapshot, applying every documented override rule. Mutates no
     /// global state, so tests can assert each override deterministically.

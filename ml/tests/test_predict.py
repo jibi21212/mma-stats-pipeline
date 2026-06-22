@@ -181,6 +181,49 @@ def test_gate_matchup_uses_allow_unknown_division_constant(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# 2c) Weight-class ladder — the SINGLE source for the TUI's class picker
+# --------------------------------------------------------------------------- #
+
+def test_weight_class_ladder_sourced_from_constants():
+    # weight_class_ladder() must be built FROM MEN_LADDER + WOMEN_LADDER (names +
+    # ordinals never re-typed), so the picker the TUI shows can never drift from the
+    # gating ladders. Reconstruct the expected list straight from the constants.
+    ladder = P.weight_class_ladder()
+    expected = (
+        [{"name": n, "gender": "M", "ordinal": o} for n, o in P.MEN_LADDER.items()]
+        + [{"name": n, "gender": "W", "ordinal": o} for n, o in P.WOMEN_LADDER.items()]
+    )
+    assert ladder == expected
+
+
+def test_weight_class_ladder_covers_men_and_women():
+    ladder = P.weight_class_ladder()
+    # Every MEN_LADDER entry appears with gender "M" and its ordinal.
+    for name, ordinal in P.MEN_LADDER.items():
+        assert {"name": name, "gender": "M", "ordinal": ordinal} in ladder
+    # Every WOMEN_LADDER entry appears with gender "W" and its ordinal.
+    for name, ordinal in P.WOMEN_LADDER.items():
+        assert {"name": name, "gender": "W", "ordinal": ordinal} in ladder
+    # Length is exactly the two ladders combined (no extras, no drops).
+    assert len(ladder) == len(P.MEN_LADDER) + len(P.WOMEN_LADDER)
+    # Documented headline entries (the contract the TUI's picker shows).
+    assert {"name": "Flyweight", "gender": "M", "ordinal": 1} in ladder
+    assert {"name": "Heavyweight", "gender": "M", "ordinal": 8} in ladder
+    assert {"name": "Women's Strawweight", "gender": "W", "ordinal": 1} in ladder
+
+
+def test_weight_class_ladder_membership_matches_divisions():
+    # A fighter "is in" a class C iff their (gender, ordinal) divisions contain
+    # (C["gender"], C["ordinal"]) -- prove each ladder entry's identity matches the
+    # tuple form that normalize_weight_class / the persisted divisions use.
+    for entry in P.weight_class_ladder():
+        identity = (entry["gender"], entry["ordinal"])
+        # This identity is exactly what normalize_weight_class yields for the class
+        # name (using DIVISION_NAMES as the reverse lookup oracle).
+        assert P.DIVISION_NAMES[identity] == entry["name"]
+
+
+# --------------------------------------------------------------------------- #
 # 3) Leakage: the as-of-date feature builder uses only fights < N
 # --------------------------------------------------------------------------- #
 

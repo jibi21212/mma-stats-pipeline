@@ -8,71 +8,14 @@
 //! `src/anim.rs` already carries its own `#[cfg(test)] mod tests`; wrapping the
 //! include in a private module keeps those inner unit tests from colliding with
 //! the integration cases below (we only re-export the public API we use here).
+//!
+//! There is NO fighter animation: the loading overlay's only motion is the
+//! braille spinner, so these tests cover the spinner + the one-shot MMA intro.
 
 #[path = "../src/anim.rs"]
 mod anim_impl;
 
-use anim_impl::{
-    ANIM_FPS, FIGHTER_CYCLE, FIGHTER_ROWS, FIGHTER_WIDTH, FighterPhase, INTRO_TICKS,
-    SPINNER_FRAMES, fighter_phase, fighters_frame, intro_done, mma_intro, spinner_frame,
-};
-use ratatui::style::Color;
-use ratatui::text::Line;
-
-// --- helpers for the COLORED (half-block) fighters API ---------------------
-
-/// Rendered cell width of a rasterized line (one span per pixel column).
-fn line_cells(line: &Line<'static>) -> usize {
-    line.spans.len()
-}
-
-/// A frame's "lit cell" signature: which (row, col) cells carry color (i.e. are
-/// not a plain space). Lets us compare frames for motion without caring about
-/// exact RGB, replacing the old text-based pose comparison.
-fn lit_signature(lines: &[Line<'static>]) -> Vec<(usize, usize)> {
-    let mut sig = Vec::new();
-    for (r, line) in lines.iter().enumerate() {
-        for (c, span) in line.spans.iter().enumerate() {
-            if span.content.as_ref() != " " {
-                sig.push((r, c));
-            }
-        }
-    }
-    sig
-}
-
-/// Does this frame contain any clearly RED-dominant truecolor pixel (the RED
-/// corner's gloves/shorts)? Checks both the fg (top pixel) and bg (bottom pixel)
-/// of every cell so a red pixel in either half-block slot counts.
-fn has_red_corner(lines: &[Line<'static>]) -> bool {
-    lines.iter().any(|line| {
-        line.spans.iter().any(|s| {
-            let fg = matches!(s.style.fg, Some(Color::Rgb(r, g, b)) if r > 150 && g < 120 && b < 120);
-            let bg = matches!(s.style.bg, Some(Color::Rgb(r, g, b)) if r > 150 && g < 120 && b < 120);
-            fg || bg
-        })
-    })
-}
-
-/// Does this frame contain any clearly BLUE-dominant truecolor pixel (the BLUE
-/// corner's gloves/shorts)? Blue dominant == high blue, low red.
-fn has_blue_corner(lines: &[Line<'static>]) -> bool {
-    lines.iter().any(|line| {
-        line.spans.iter().any(|s| {
-            let fg = matches!(s.style.fg, Some(Color::Rgb(r, _g, b)) if b > 150 && r < 120);
-            let bg = matches!(s.style.bg, Some(Color::Rgb(r, _g, b)) if b > 150 && r < 120);
-            fg || bg
-        })
-    })
-}
-
-/// The peak frame of each striking beat, derived from the shared 6-beat
-/// [`FIGHTER_CYCLE`] timeline (Bob, RedJab, Reset, Bob, BlueKick, Reset). The
-/// peak of a beat is its midpoint, where the tweened limb is fully extended.
-fn beat_midpoint(beat: usize) -> usize {
-    let beat_len = FIGHTER_CYCLE / 6;
-    beat * beat_len + beat_len / 2
-}
+use anim_impl::{ANIM_FPS, INTRO_TICKS, SPINNER_FRAMES, intro_done, mma_intro, spinner_frame};
 
 // --- spinner ---------------------------------------------------------------
 
@@ -94,182 +37,22 @@ fn spinner_only_emits_known_braille_glyphs() {
     }
 }
 
-// --- intro_done ------------------------------------------------------------
-
 #[test]
-fn intro_done_is_a_clean_threshold() {
-    assert!(!intro_done(0));
-    assert!(!intro_done(INTRO_TICKS - 1));
-    assert!(intro_done(INTRO_TICKS));
-    assert!(intro_done(usize::MAX));
-}
-
-// --- fighters (COLORED half-block API) -------------------------------------
-
-#[test]
-fn fighters_frame_every_frame_nonempty_and_uniform_width() {
-    let width = line_cells(&fighters_frame(0)[0]);
-    assert!(width > 0);
-    // Cover well past several loop periods.
-    for f in 0..512usize {
-        let lines = fighters_frame(f);
-        assert!(!lines.is_empty(), "empty frame at {f}");
-        for line in &lines {
-            assert_eq!(
-                line_cells(line),
-                width,
-                "non-uniform width at frame {f}"
+fn spinner_advances_within_an_e2e_capture_window() {
+    // The e2e no-freeze test captures the running overlay twice ~300ms apart (= ~9
+    // frames at 30 fps) and asserts the SPINNER glyph CHANGED. With a 10-glyph
+    // cycle, any offset of 1..=9 frames lands on a DIFFERENT glyph (the cycle only
+    // returns to the same glyph after a full 10 frames). ~9 frames sits safely
+    // inside that window. Prove it for every phase: from every starting frame, the
+    // glyph 7..=9 frames later differs.
+    for f in 0..SPINNER_FRAMES.len() {
+        for delta in 7..=9usize {
+            assert_ne!(
+                spinner_frame(f),
+                spinner_frame(f + delta),
+                "spinner at frame {f} should differ from frame {} (~300ms later)",
+                f + delta
             );
-        }
-    }
-}
-
-#[test]
-fn fighters_frame_height_is_stable() {
-    let h = fighters_frame(0).len();
-    for f in 0..512usize {
-        assert_eq!(fighters_frame(f).len(), h, "height changed at frame {f}");
-    }
-}
-
-#[test]
-fn fighters_frame_is_deterministic() {
-    for f in [0usize, 1, 5, 13, 99, 1234] {
-        assert_eq!(lit_signature(&fighters_frame(f)), lit_signature(&fighters_frame(f)));
-    }
-}
-
-#[test]
-fn fighters_frame_loops() {
-    // Find the smallest p that is a genuine period: the whole sequence repeats
-    // (by lit-cell signature) with stride p over a wide window.
-    const WINDOW: usize = 256;
-    let mut period = None;
-    for p in 1..WINDOW {
-        if (0..WINDOW).all(|f| lit_signature(&fighters_frame(f)) == lit_signature(&fighters_frame(f + p)))
-        {
-            period = Some(p);
-            break;
-        }
-    }
-    let period = period.expect("choreography should loop within the window");
-    assert!(period >= 4, "loop period unreasonably short: {period}");
-    // Stability across multiple cycles.
-    for f in 0..period {
-        assert_eq!(
-            lit_signature(&fighters_frame(f)),
-            lit_signature(&fighters_frame(f + period * 3))
-        );
-    }
-}
-
-#[test]
-fn fighters_frame_shows_distinct_action() {
-    // Over a long window the fighters should take on several distinct frames
-    // (motion), proving the animation is alive.
-    let mut seen = std::collections::HashSet::new();
-    for f in 0..256usize {
-        seen.insert(lit_signature(&fighters_frame(f)));
-    }
-    assert!(
-        seen.len() >= 4,
-        "expected several distinct frames, got {}",
-        seen.len()
-    );
-}
-
-#[test]
-fn fighters_frame_emits_truecolor() {
-    // The colored API must surface truecolor (Rgb) pixels — the red/blue corners.
-    let mut saw_rgb = false;
-    for f in 0..256usize {
-        for line in fighters_frame(f) {
-            for span in &line.spans {
-                if matches!(span.style.fg, Some(Color::Rgb(..))) {
-                    saw_rgb = true;
-                }
-            }
-        }
-    }
-    assert!(saw_rgb, "fighters_frame should emit truecolor pixels");
-}
-
-#[test]
-fn fighters_frame_renders_both_corners() {
-    // The two boxers are a RED corner and a BLUE corner: a single neutral frame
-    // must contain BOTH red-dominant and blue-dominant truecolor pixels (gloves
-    // / shorts), proving each fighter is tinted to its corner — not just "some
-    // Rgb somewhere".
-    let neutral = fighters_frame(0);
-    assert!(
-        has_red_corner(&neutral),
-        "expected RED-corner pixels in the fighters frame"
-    );
-    assert!(
-        has_blue_corner(&neutral),
-        "expected BLUE-corner pixels in the fighters frame"
-    );
-    // And both corners are present throughout the whole loop (neither fighter
-    // ever vanishes), even mid-strike.
-    for f in 0..FIGHTER_CYCLE {
-        let lines = fighters_frame(f);
-        assert!(has_red_corner(&lines), "RED corner missing at frame {f}");
-        assert!(has_blue_corner(&lines), "BLUE corner missing at frame {f}");
-    }
-}
-
-#[test]
-fn fighters_frame_has_distinct_key_poses() {
-    // The three signature poses — idle stance, RED's jab fully extended, and
-    // BLUE's kick fully extended — must each look DIFFERENT from the others, so
-    // the choreography reads as bob → jab → kick rather than a static blob.
-    let idle = lit_signature(&fighters_frame(beat_midpoint(0))); // Bob beat
-    let jab = lit_signature(&fighters_frame(beat_midpoint(1))); // RedJab beat
-    let kick = lit_signature(&fighters_frame(beat_midpoint(4))); // BlueKick beat
-
-    assert_ne!(idle, jab, "idle stance and RED jab should differ");
-    assert_ne!(idle, kick, "idle stance and BLUE kick should differ");
-    assert_ne!(jab, kick, "RED jab and BLUE kick should differ");
-
-    // The jab should reach FURTHER RIGHT than idle (RED's lead glove extends
-    // toward BLUE), and the kick FURTHER LEFT (BLUE's leg extends toward RED).
-    let max_col = |sig: &[(usize, usize)]| sig.iter().map(|&(_, c)| c).max().unwrap_or(0);
-    let min_col = |sig: &[(usize, usize)]| sig.iter().map(|&(_, c)| c).min().unwrap_or(usize::MAX);
-    assert!(
-        max_col(&jab) >= max_col(&idle),
-        "RED jab should extend at least as far right as the idle stance"
-    );
-    assert!(
-        min_col(&kick) <= min_col(&idle),
-        "BLUE kick should extend at least as far left as the idle stance"
-    );
-}
-
-#[test]
-fn fighters_frame_strikes_retract_for_a_seamless_loop() {
-    // Each striking beat must START and END at (lit-cell) neutral so the limb is
-    // retracted by the time the next beat begins — otherwise the loop would jump.
-    // Compare the first frame of the RedJab beat with the first frame of the
-    // following Reset beat's predecessor (the last frame of RedJab).
-    let beat_len = FIGHTER_CYCLE / 6;
-    // Last frame of the RedJab beat == one before the Reset beat starts.
-    let jab_start = lit_signature(&fighters_frame(beat_len)); // RedJab begins
-    let jab_end = lit_signature(&fighters_frame(2 * beat_len - 1)); // RedJab ends
-    let jab_peak = lit_signature(&fighters_frame(beat_midpoint(1)));
-    // The peak differs from both ends (the punch actually moved out)…
-    assert_ne!(jab_peak, jab_start, "jab never left the stance");
-    assert_ne!(jab_peak, jab_end, "jab never retracted");
-}
-
-#[test]
-fn fighters_frame_dimensions_match_the_frozen_contract() {
-    // Belt-and-suspenders: the sprite must fill EXACTLY the contracted grid the
-    // loading panel is sized off of, at several frames across the loop.
-    for f in [0usize, beat_midpoint(1), beat_midpoint(4), FIGHTER_CYCLE - 1] {
-        let lines = fighters_frame(f);
-        assert_eq!(lines.len(), FIGHTER_ROWS, "row count at frame {f}");
-        for line in &lines {
-            assert_eq!(line_cells(line), FIGHTER_WIDTH, "width at frame {f}");
         }
     }
 }
@@ -283,26 +66,14 @@ fn anim_fps_is_a_smooth_target() {
     );
 }
 
-#[test]
-fn fighter_phase_covers_the_beats() {
-    let mut phases = std::collections::HashSet::new();
-    for f in 0..256usize {
-        phases.insert(fighter_phase(f).0);
-    }
-    for p in [
-        FighterPhase::Bob,
-        FighterPhase::RedJab,
-        FighterPhase::BlueKick,
-        FighterPhase::Reset,
-    ] {
-        assert!(phases.contains(&p), "choreography missing phase {p:?}");
-    }
-}
+// --- intro_done ------------------------------------------------------------
 
 #[test]
-fn fighters_frame_no_panic_at_extremes() {
-    let _ = fighters_frame(0);
-    let _ = fighters_frame(usize::MAX);
+fn intro_done_is_a_clean_threshold() {
+    assert!(!intro_done(0));
+    assert!(!intro_done(INTRO_TICKS - 1));
+    assert!(intro_done(INTRO_TICKS));
+    assert!(intro_done(usize::MAX));
 }
 
 // --- mma_intro -------------------------------------------------------------

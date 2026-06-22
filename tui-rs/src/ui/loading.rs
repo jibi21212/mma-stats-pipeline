@@ -1,11 +1,15 @@
 //! The loading overlay shown whenever a background job is in flight (or its
-//! finished log is still on screen). TOP = two ASCII fighters mid-choreography
-//! (`anim::fighters_frame`); BOTTOM = a braille spinner + elapsed time + a
-//! progress bar + the live tail of the job log.
+//! finished log is still on screen). TOP = a braille spinner + the job's status
+//! label + elapsed time, then a progress bar, then the live tail of the job log.
+//!
+//! There is NO fighter/stick-man art — the overlay is deliberately minimal: a
+//! spinner while running (frozen to a static result glyph once finished), a
+//! determinate-or-pulsing progress bar (frozen at 100%/✓ on completion), and the
+//! streaming log.
 //!
 //! Owned by the Foundation agent (it is the job-overlay routing the spec asks
 //! for). It calls into the PURE `anim` frame generators, so the anim agent can
-//! swap in the real choreography without touching this file.
+//! swap in the spinner without touching this file.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -24,42 +28,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    // The fighters panel is FIGHTER_ROWS tall (half-block pixel art) + a 2-row
-    // border; the rest goes to the status/progress strip and the live log.
-    let fighters_h = (anim::FIGHTER_ROWS as u16) + 2;
-    let [fighters_area, spinner_area, log_area] = Layout::vertical([
-        Constraint::Length(fighters_h),
-        Constraint::Length(3),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    // A compact status strip (spinner + label + elapsed, alongside the progress
+    // bar) on top, then the live log fills the rest.
+    let [status_area, log_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
 
-    render_fighters(frame, fighters_area, app);
-    render_spinner(frame, spinner_area, app);
+    render_status(frame, status_area, app);
     render_log(frame, log_area, job.log.as_slice());
 }
 
-fn render_fighters(frame: &mut Frame, area: Rect, app: &App) {
-    // COLORED half-block fighters. While the job is finished we FREEZE the
-    // choreography on a single frame so the panel goes still alongside the
-    // progress bar (no more perpetual motion after the work is done).
-    let anim_frame = match app.job_status() {
-        Some(s) if s.is_finished() => 0,
-        _ => app.anim_frame(),
-    };
-    let lines: Vec<Line> = anim::fighters_frame(anim_frame);
-    let kind = app
-        .job
-        .as_ref()
-        .map(|j| j.kind.label())
-        .unwrap_or("Working");
-    let p = Paragraph::new(lines)
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(titled_block(kind));
-    frame.render_widget(p, area);
-}
-
-fn render_spinner(frame: &mut Frame, area: Rect, app: &App) {
+fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let Some(job) = app.job.as_ref() else {
         return;
     };
@@ -67,19 +45,23 @@ fn render_spinner(frame: &mut Frame, area: Rect, app: &App) {
     let [info_area, bar_area] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
 
-    // Spinner + elapsed + status. The spinner only spins while RUNNING; once the
-    // job finishes it locks to a static result glyph.
-    let spinner = anim::spinner_frame(app.anim_frame());
+    // Spinner + status label + elapsed. The spinner only spins while RUNNING; once
+    // the job finishes it locks to a static result glyph (freeze-on-finish), so the
+    // strip goes still alongside the progress bar.
     let elapsed = job.elapsed_secs();
+    let label = job.kind.label();
     let (status_text, status_color) = match job.status {
         JobStatus::Running => ("running", Color::Yellow),
         JobStatus::Done => ("✓ done", Color::Green),
         JobStatus::Failed => ("✗ failed", Color::Red),
     };
     let head = if job.status == JobStatus::Running {
-        format!("{spinner} {status_text}  {elapsed}s")
+        // Animated braille spinner driven by the still-ticking event loop.
+        let spinner = anim::spinner_frame(app.anim_frame());
+        format!("{spinner} {label}…  {status_text}  {elapsed}s")
     } else {
-        format!("● {status_text}  {elapsed}s")
+        // FINISHED: a static result glyph, no spinner (motion stops with the work).
+        format!("✓ {label}  {status_text}  {elapsed}s")
     };
     let info = Paragraph::new(Line::from(Span::styled(
         head,
@@ -95,7 +77,7 @@ fn render_spinner(frame: &mut Frame, area: Rect, app: &App) {
     //                  the last-known fill). It must NOT keep animating 0->100.
     //   * RUNNING + parsed "N/M" progress -> a determinate bar at done/total.
     //   * RUNNING + no progress yet        -> a tasteful indeterminate pulse.
-    let (ratio, label, gauge_fg) = match job.status {
+    let (ratio, bar_label, gauge_fg) = match job.status {
         JobStatus::Done => (1.0_f64, "✓ done · 100%".to_string(), Color::Green),
         JobStatus::Failed => {
             // Freeze at whatever fraction was reached; never re-sweep.
@@ -122,7 +104,7 @@ fn render_spinner(frame: &mut Frame, area: Rect, app: &App) {
         .block(titled_block("Progress"))
         .gauge_style(Style::default().fg(gauge_fg).bg(Color::Black))
         .ratio(ratio.clamp(0.0, 1.0))
-        .label(label);
+        .label(bar_label);
     frame.render_widget(gauge, bar_area);
 }
 
