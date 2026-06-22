@@ -51,6 +51,7 @@ fn main() -> Result<()> {
     let config = Config::load()?;
     let db = Db::open(&config.db_path)?;
     let sidecar = Sidecar::start(&config)?;
+
     let mut app = App::new(config, db, sidecar)?;
 
     // Enter the alternate screen + raw mode. `init` installs a panic hook that

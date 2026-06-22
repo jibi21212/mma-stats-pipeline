@@ -18,8 +18,8 @@
 //!   * DATABASE is a hub with two working paths: "Browse events" (events → a card
 //!     → a fighter) and "Find a fighter" (live fuzzy search → a fighter profile).
 //!   * Long actions (scrape) run on a BACKGROUND thread and stream into a loading
-//!     overlay (two ASCII fighters + a braille spinner + a progress bar + the live
-//!     log) while the event loop KEEPS TICKING (never freezes).
+//!     overlay (a braille spinner + a progress bar + the live log) while the event
+//!     loop KEEPS TICKING (never freezes).
 //!
 //! HERMETIC: every (non-ignored) test points the binary at lightweight stubs via
 //! env overrides resolved in `src/config.rs`, so there is NO network, NO real
@@ -960,11 +960,139 @@ fn predict_shows_probability_and_tale() {
     assert!(s.wait_clean_exit());
 }
 
+/// 4b. PREDICT — WEIGHT-CLASS filter: the new ⇥ (Tab) control cycles a weight-class
+///     selector whose chips come ENTIRELY from the sidecar-fetched weight_classes
+///     ([Middleweight M#6, Heavyweight M#8] in the stub), and selecting a class
+///     filters BOTH slots' candidate pools to fighters who fought in it — composing
+///     with the eligibility rules on the other slot.
+///
+///     Stub membership (DIVISIONS): Pereira M#8 (Heavyweight); Adesanya + Whittaker
+///     M#6 (Middleweight). So:
+///       * default "All weight classes" -> slot A lists all 3 (Matches (3)).
+///       * ⇥ once -> "Middleweight" -> slot A lists Adesanya + Whittaker only
+///         (Matches (2)); Pereira filtered OUT.
+///       * ⇥ again -> "Heavyweight" -> slot A lists only Pereira (Matches (1));
+///         the Middleweights filtered OUT.
+///     The chips also render their member counts derived from membership:
+///     "Middleweight (2)" and "Heavyweight (1)".
+#[test]
+fn predict_weight_class_filters_candidate_pool() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    // Home -> Predict (Down twice -> index 2, Enter).
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Fighter A");
+
+    // The weight-class selector renders with the All chip + both fetched classes
+    // (names + membership counts come from the sidecar, nothing hardcoded in Rust).
+    let sel = s.wait_for("All weight classes");
+    assert!(
+        sel.contains("Middleweight (2)") && sel.contains("Heavyweight (1)"),
+        "the class selector should list the fetched classes with member counts:\n{sel}"
+    );
+
+    // Default "All weight classes": slot A's candidate list holds all 3 roster names.
+    let all = s.wait_for("Matches (3)");
+    let all_list = results_list_region(&all);
+    assert!(
+        all_list.contains("Alex Pereira")
+            && all_list.contains("Israel Adesanya")
+            && all_list.contains("Robert Whittaker"),
+        "with All selected, slot A should list all 3 fighters:\n{all_list}"
+    );
+
+    // ⇥ once -> Middleweight. Slot A narrows to the two Middleweights; Pereira is
+    // filtered OUT (membership, not eligibility — there is no other slot yet).
+    s.send(TAB);
+    let mw = s.wait_for("Weight class — Middleweight");
+    let mw_list = results_list_region(&s.wait_for("Matches (2)"));
+    assert!(
+        mw_list.contains("Israel Adesanya") && mw_list.contains("Robert Whittaker"),
+        "Middleweight should surface Adesanya + Whittaker:\n{mw_list}"
+    );
+    assert!(
+        !mw_list.contains("Alex Pereira"),
+        "Middleweight must filter Pereira (M#8) OUT of slot A:\n{mw_list}"
+    );
+    assert!(
+        mw.contains("Weight class — Middleweight"),
+        "the selector title should reflect the active class:\n{mw}"
+    );
+
+    // ⇥ again -> Heavyweight. Slot A narrows to ONLY Pereira.
+    s.send(TAB);
+    s.wait_for("Weight class — Heavyweight");
+    let hw_list = results_list_region(&s.wait_for("Matches (1)"));
+    assert!(
+        hw_list.contains("Alex Pereira"),
+        "Heavyweight should surface Pereira:\n{hw_list}"
+    );
+    assert!(
+        !hw_list.contains("Israel Adesanya") && !hw_list.contains("Robert Whittaker"),
+        "Heavyweight must filter the Middleweights OUT of slot A:\n{hw_list}"
+    );
+
+    s.send("q");
+    assert!(s.wait_clean_exit());
+}
+
+/// 4c. PREDICT — WEIGHT-CLASS composes with ELIGIBILITY on slot B: with
+///     "Middleweight" selected, commit slot A = Adesanya; slot B's pool is then
+///     in-class (Middleweight) AND eligible vs Adesanya. Whittaker (M#6, distance 0)
+///     qualifies and Pereira (M#8) is excluded BOTH by class membership and by the
+///     max_distance-1 gate. So the single slot-B candidate is Whittaker, and the
+///     prediction fires with the stub's 62%/38% split — proving the class filter and
+///     the eligibility rules compose (pool = in-class AND eligible).
+#[test]
+fn predict_weight_class_composes_with_eligibility() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Fighter A");
+    s.wait_for("All weight classes");
+
+    // ⇥ once -> Middleweight (the class with Adesanya + Whittaker).
+    s.send(TAB);
+    s.wait_for("Weight class — Middleweight");
+    // Slot A in-class pool = [Adesanya, Whittaker]; sorted index 0 = Adesanya.
+    s.wait_for("Matches (2)");
+
+    // Commit slot A = Israel Adesanya (index 0 of the in-class, sorted pool).
+    s.send(ENTER);
+    s.wait_for("✓ Israel Adesanya");
+
+    // Slot B's pool = in-class (Middleweight) AND eligible vs Adesanya = [Whittaker].
+    // Pereira is excluded by BOTH the class filter and the distance gate, so the
+    // single candidate at index 0 is Whittaker; Enter commits B.
+    s.send(ENTER);
+    s.wait_for("✓ Robert Whittaker");
+
+    // The composed selection produced a valid matchup -> prediction fires.
+    let screen = s.wait_for("62%");
+    assert!(
+        screen.contains("38%") && screen.contains("Win probability"),
+        "the composed matchup should produce the stub prediction:\n{screen}"
+    );
+    // No refusal vocabulary: the pool was pre-filtered locally, never refused.
+    let lower = screen.to_lowercase();
+    for forbidden in ["refused", "ineligible", "not allowed"] {
+        assert!(
+            !lower.contains(forbidden),
+            "a composed in-class eligible matchup must not show a refusal ({forbidden:?}):\n{screen}"
+        );
+    }
+
+    s.send("q");
+    assert!(s.wait_clean_exit());
+}
+
 /// 5. SCRAPE — chips + NO-FREEZE + animation + streaming + completion.
 ///
 ///    Home -> Scrape; assert the "Full: OFF" chip, press f and assert it flips to
 ///    "Full: ON" INSTANTLY; press Enter to run the (stub) scraper. WHILE it runs
-///    we prove the UI is NOT frozen: the loading overlay's two-fighter animation
+///    we prove the UI is NOT frozen: the loading overlay's braille SPINNER glyph
 ///    advances between two timed captures AND the streamed log/progress arrives
 ///    PROGRESSIVELY (we catch a mid-run "saved event 1/3" before the later
 ///    "saved event 3/3"). Finally the app's own completion marker appears.
@@ -1017,21 +1145,37 @@ fn scrape_chips_no_freeze_and_streams() {
         "the scraper banner line should stream in early:\n{early}"
     );
 
-    // NO-FREEZE PROOF #2 — the animation is advancing. Capture the fighters panel
-    // twice ~250ms apart; the rendered pose must change (the choreography is
-    // frame-driven by the still-ticking event loop). We compare the body region
-    // below the "Scraping" overlay title.
-    let frame_a = overlay_fighters(&s.screen());
-    std::thread::sleep(Duration::from_millis(250));
-    let frame_b = overlay_fighters(&s.screen());
+    // NO-FREEZE PROOF #2 — the spinner is advancing. The overlay's only motion is
+    // the braille spinner in the Status panel, which the still-ticking event loop
+    // re-renders every frame (driven by wall-clock time). We SAMPLE the live spinner
+    // glyph repeatedly across a window that spans many animation frames and assert it
+    // takes on MORE THAN ONE distinct value. A frozen event loop can only ever render
+    // a single glyph, so >1 distinct glyph is exactly the liveness signal — and
+    // sampling many times (rather than diffing two fixed captures) makes this immune
+    // to braille-cycle aliasing AND scheduling jitter. We re-confirm the job is still
+    // RUNNING so we never sample a finished (frozen "✓") overlay.
+    s.wait_for("running");
+    let mut spinner_glyphs = std::collections::HashSet::new();
+    let spin_start = Instant::now();
+    while spin_start.elapsed() < Duration::from_millis(700) {
+        let g = overlay_spinner(&s.screen());
+        if !g.is_empty() {
+            spinner_glyphs.insert(g);
+        }
+        if spinner_glyphs.len() >= 2 {
+            break; // already proved it advanced; no need to keep sampling.
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
     assert!(
-        !frame_a.is_empty(),
-        "the fighters animation panel should have content while running:\n{frame_a}"
+        !spinner_glyphs.is_empty(),
+        "the running overlay should show a braille spinner glyph:\n{}",
+        s.screen()
     );
     assert!(
-        frame_a != frame_b,
-        "the fighters animation must ADVANCE between captures (loop not frozen).\n\
-         --- frame A ---\n{frame_a}\n--- frame B ---\n{frame_b}"
+        spinner_glyphs.len() >= 2,
+        "the braille spinner must ADVANCE while the job runs (event loop not frozen); \
+         saw only {spinner_glyphs:?} across the sampling window"
     );
 
     // Streaming continues to the final progress line.
@@ -1169,34 +1313,35 @@ fn overlay_progress(screen: &str) -> String {
     out.join("\n")
 }
 
-/// Extract the loading overlay's two-fighter animation body (the rows between the
-/// "Scraping" panel border and the "Status" panel below it). Used to prove the
-/// animation advances frame-to-frame. Returns the trimmed joined rows; empty if
-/// the overlay isn't up.
-fn overlay_fighters(screen: &str) -> String {
+/// The set of braille spinner glyphs the loading overlay cycles through (mirrors
+/// `anim::SPINNER_FRAMES`). Used to scrape the live spinner glyph off the rendered
+/// Status panel so the no-freeze test can prove it ADVANCES.
+const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Extract the loading overlay's live braille SPINNER glyph from the rendered
+/// "Status" panel (the head reads e.g. "⠋ Scraping…  running  3s" while running).
+/// Returns the spinner char as a one-char String, or empty if no spinner glyph is
+/// on screen (e.g. the overlay isn't up, or the job already finished and the
+/// spinner froze to a static "✓"). Scanning for the known braille glyphs makes the
+/// scrape robust to surrounding text/layout.
+fn overlay_spinner(screen: &str) -> String {
     let lines: Vec<&str> = screen.lines().collect();
-    let Some(start) = lines.iter().position(|l| l.contains("Scraping")) else {
+    // The Status + Progress panels share the same rows (a horizontal split), so the
+    // border row carrying " Status " also carries " Progress ". Start scanning from
+    // that row and stop at the "Output" log panel below; the spinner glyph sits on
+    // the content line just under the border, on the left (Status) half.
+    let Some(start) = lines.iter().position(|l| l.contains("Status")) else {
         return String::new();
     };
-    // Collect the body lines after the "Scraping" title until the next panel
-    // ("Status"/"Progress"/"Output"). The fighters panel is ~8 rows tall.
-    let mut out: Vec<String> = Vec::new();
-    for l in lines.iter().skip(start + 1) {
-        if l.contains("Status") || l.contains("Progress") || l.contains("Output") {
+    for l in lines.iter().skip(start) {
+        if l.contains("Output (") {
             break;
         }
-        // Keep only the inner content (strip box-drawing frame chars + spaces) so
-        // two captures differ ONLY when the pose actually changes.
-        let inner: String = l
-            .chars()
-            .filter(|c| !matches!(c, '│' | '┌' | '┐' | '└' | '┘' | '─'))
-            .collect();
-        let inner = inner.trim();
-        if !inner.is_empty() {
-            out.push(inner.to_string());
+        if let Some(g) = l.chars().find(|c| SPINNER_GLYPHS.contains(c)) {
+            return g.to_string();
         }
     }
-    out.join("\n")
+    String::new()
 }
 
 // =========================================================================== //

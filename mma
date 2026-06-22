@@ -10,12 +10,34 @@
 # native binary, so startup is instant.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script's real location, following symlinks. The installers put a
+# symlink to this file on $PATH (e.g. ~/.local/bin/mma), so $BASH_SOURCE may BE a
+# symlink; we must chase it to the repo checkout before deriving ROOT. (BSD
+# `readlink` has no portable `-f`, so we walk the chain by hand.)
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  dir="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  # If the link target is relative, resolve it against the link's directory.
+  [[ "$SOURCE" != /* ]] && SOURCE="$dir/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 cd "$ROOT"   # so the TUI resolves the bundled data/ufc.db, .venv python, scraper
 
 BIN="$ROOT/tui-rs/target/release/mma-tui"
+
+# Self-bootstrap: on a fresh checkout the .venv or the release binary won't
+# exist yet. Run the one-time build-from-source setup, THEN launch. On the happy
+# path (already set up) both checks pass instantly, so this costs nothing.
+if [[ ! -x "$ROOT/.venv/bin/python" || ! -x "$BIN" ]]; then
+  echo "mma: first run — building from source (one time)…" >&2
+  "$ROOT/scripts/setup.sh"
+fi
+
 if [[ -x "$BIN" ]]; then
   exec "$BIN" "$@"
 fi
 
+# Fallback: setup did not produce the binary (e.g. cargo target dir relocated).
+# Build-and-run via cargo so the launcher still works.
 exec cargo run --release --manifest-path "$ROOT/tui-rs/Cargo.toml" -- "$@"

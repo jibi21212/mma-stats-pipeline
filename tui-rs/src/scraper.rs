@@ -6,6 +6,7 @@
 //! module only invokes it and relays progress — it never touches the DB.
 
 use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -45,8 +46,25 @@ pub fn run<F>(cfg: &Config, opts: &ScrapeOptions, on_line: F) -> Result<ExitStat
 where
     F: FnMut(&str),
 {
-    let mut command = build_command(&cfg.scraper, opts);
+    let mut command = build_command(&cfg.scraper, opts, db_flag(cfg).as_deref());
     run_command(&mut command, on_line)
+}
+
+/// Compute the `--db <path>` value to pass to the scraper, or `None` to preserve
+/// the scraper's own relative default.
+///
+/// The Go scraper is the SOLE DB WRITER. When the active `db_path` matches the
+/// repo default (`<repo>/data/ufc.db`), we pass NOTHING so the scraper keeps its
+/// built-in relative default (`../data/ufc.db`, resolved against its `scraper-go`
+/// cwd) — identical to prior behavior. When `db_path` was overridden (an
+/// installed/writable copy or `$MMA_DB`), we pass that ABSOLUTE path via `--db`
+/// so the writer targets the location the rest of the app reads.
+fn db_flag(cfg: &Config) -> Option<std::path::PathBuf> {
+    if cfg.db_path == cfg.default_db_path() {
+        None
+    } else {
+        Some(cfg.db_path.clone())
+    }
 }
 
 /// Spawn the scraper on a BACKGROUND thread and return IMMEDIATELY with a
@@ -61,9 +79,10 @@ where
 pub fn run_async(cfg: &Config, opts: &ScrapeOptions) -> std::sync::mpsc::Receiver<JobMsg> {
     let (tx, rx) = mpsc::channel::<JobMsg>();
     let launch = cfg.scraper.clone();
+    let db = db_flag(cfg);
     let opts = opts.clone();
     thread::spawn(move || {
-        let mut command = build_command(&launch, &opts);
+        let mut command = build_command(&launch, &opts, db.as_deref());
         let success = match run_command(&mut command, |line| {
             // Forward progress events first when the line encodes them.
             if let Some((done, total)) = parse_progress(line) {
@@ -120,13 +139,19 @@ pub fn parse_progress(line: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Build the [`Command`] for one scraper run from the launch method + options.
+/// Build the [`Command`] for one scraper run from the launch method, options,
+/// and an optional explicit DB path.
 ///
 /// For [`ScraperLaunch::Binary`] the binary is executed directly with the
 /// scraper directory as the working dir. For [`ScraperLaunch::GoRun`] we invoke
 /// `go run .` inside the configured directory. Flags are appended identically in
 /// both cases.
-fn build_command(launch: &ScraperLaunch, opts: &ScrapeOptions) -> Command {
+///
+/// `db` is the resolved DB path to write, or `None` to leave the scraper's own
+/// relative default (`../data/ufc.db`) in place. Callers pass `Some` only when
+/// the configured `db_path` was overridden (see [`db_flag`]), so the default run
+/// is byte-for-byte unchanged from before.
+fn build_command(launch: &ScraperLaunch, opts: &ScrapeOptions, db: Option<&Path>) -> Command {
     let mut command = match launch {
         ScraperLaunch::Binary(path) => {
             let mut c = Command::new(path);
@@ -144,13 +169,20 @@ fn build_command(launch: &ScraperLaunch, opts: &ScrapeOptions) -> Command {
             c
         }
     };
-    append_flags(&mut command, opts);
+    append_flags(&mut command, opts, db);
     command
 }
 
 /// Append the option-derived CLI flags to `command` (shared by both launch
 /// kinds). The incremental default passes no extra flags.
-fn append_flags(command: &mut Command, opts: &ScrapeOptions) {
+///
+/// When `db` is `Some`, `--db <path>` is appended FIRST so the scraper writes to
+/// the configured (overridden) location; when `None`, no `--db` is passed and
+/// the scraper keeps its built-in relative default.
+fn append_flags(command: &mut Command, opts: &ScrapeOptions, db: Option<&Path>) {
+    if let Some(db) = db {
+        command.arg("--db").arg(db);
+    }
     if opts.full {
         command.arg("--full");
     }
@@ -327,7 +359,7 @@ mod tests {
     fn append_flags_incremental_default_is_empty() {
         let opts = ScrapeOptions::default();
         let mut cmd = Command::new("true");
-        append_flags(&mut cmd, &opts);
+        append_flags(&mut cmd, &opts, None);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -343,12 +375,90 @@ mod tests {
             rate: Some(4.5),
         };
         let mut cmd = Command::new("true");
-        append_flags(&mut cmd, &opts);
+        append_flags(&mut cmd, &opts, None);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["--full", "--limit", "25", "--rate", "4.5"]);
+    }
+
+    #[test]
+    fn append_flags_prepends_db_when_path_supplied() {
+        // An overridden DB path is passed first as `--db <path>`, ahead of the
+        // option-derived flags.
+        let opts = ScrapeOptions {
+            full: true,
+            limit: Some(25),
+            rate: Some(4.5),
+        };
+        let mut cmd = Command::new("true");
+        append_flags(&mut cmd, &opts, Some(Path::new("/writable/ufc.db")));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["--db", "/writable/ufc.db", "--full", "--limit", "25", "--rate", "4.5"]
+        );
+    }
+
+    #[test]
+    fn append_flags_db_only_when_no_options() {
+        // With default options but an overridden DB, only `--db <path>` is added.
+        let opts = ScrapeOptions::default();
+        let mut cmd = Command::new("true");
+        append_flags(&mut cmd, &opts, Some(Path::new("/writable/ufc.db")));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["--db", "/writable/ufc.db"]);
+    }
+
+    #[test]
+    fn db_flag_is_none_for_default_db_path() {
+        // The default repo DB must NOT trigger a `--db` flag (preserves prior
+        // behavior: the scraper keeps its own relative default).
+        let cfg = Config::resolve(
+            std::path::PathBuf::from("/tmp/repo"),
+            &crate::config::EnvVars::default(),
+        );
+        assert_eq!(cfg.db_path, cfg.default_db_path());
+        assert_eq!(db_flag(&cfg), None);
+    }
+
+    #[test]
+    fn db_flag_is_some_for_overridden_db_path() {
+        // An installed/writable DB (modeled here via $MMA_DB) flows through as a
+        // `--db` value so the scraper writes where the app reads.
+        use crate::config::EnvVars;
+        let env = EnvVars {
+            mma_db: Some(std::ffi::OsString::from("/writable/ufc.db")),
+            ..Default::default()
+        };
+        let cfg = Config::resolve(std::path::PathBuf::from("/tmp/repo"), &env);
+        assert_eq!(db_flag(&cfg), Some(std::path::PathBuf::from("/writable/ufc.db")));
+    }
+
+    #[test]
+    fn build_command_gorun_includes_db_when_overridden() {
+        // End-to-end through build_command: an overridden DB is appended to the
+        // `go run .` invocation as `--db <path>`.
+        let opts = ScrapeOptions {
+            full: true,
+            ..Default::default()
+        };
+        let launch = ScraperLaunch::GoRun {
+            dir: std::path::PathBuf::from("/tmp/scraper-go"),
+        };
+        let cmd = build_command(&launch, &opts, Some(Path::new("/writable/ufc.db")));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["run", ".", "--db", "/writable/ufc.db", "--full"]);
     }
 
     #[test]
@@ -360,7 +470,7 @@ mod tests {
         let launch = ScraperLaunch::GoRun {
             dir: std::path::PathBuf::from("/tmp/scraper-go"),
         };
-        let cmd = build_command(&launch, &opts);
+        let cmd = build_command(&launch, &opts, None);
         assert_eq!(cmd.get_program().to_string_lossy(), "go");
         let args: Vec<String> = cmd
             .get_args()
@@ -394,7 +504,7 @@ mod tests {
             limit: Some(50),
             rate: Some(2.0),
         };
-        let cmd = build_command(&cfg.scraper, &opts);
+        let cmd = build_command(&cfg.scraper, &opts, None);
         assert_eq!(
             cmd.get_program().to_string_lossy(),
             "/fixtures/stub_scraper.sh"
@@ -413,7 +523,7 @@ mod tests {
             ..Default::default()
         };
         let launch = ScraperLaunch::Binary(std::path::PathBuf::from("/tmp/scraper-go/scraper"));
-        let cmd = build_command(&launch, &opts);
+        let cmd = build_command(&launch, &opts, None);
         assert_eq!(
             cmd.get_program().to_string_lossy(),
             "/tmp/scraper-go/scraper"

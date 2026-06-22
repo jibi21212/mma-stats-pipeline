@@ -22,9 +22,10 @@ Responses:
                    "metrics": {"test_accuracy": 0.6}, "model_path": "<stub>"}
     roster     -> {"ok": true, "fighters": [...the 3 above...]}
     eligibility-> {"ok": true, "rules": {...RULES...},
-                   "divisions": {<fighter>: [[gender, ordinal], ...]}}
-                  (see RULES + DIVISIONS below; ok:false only if a model were
-                   "not trained", which the stub never is)
+                   "divisions": {<fighter>: [[gender, ordinal], ...]},
+                   "weight_classes": [{"name", "gender", "ordinal"}, ...]}
+                  (see RULES + DIVISIONS + WEIGHT_CLASSES below; ok:false only if a
+                   model were "not trained", which the stub never is)
     predict    -> {"ok": true, "result": {... allowed, prob_a 0.62 / prob_b 0.38,
                    full tale_a / tale_b with every key, model "stub",
                    test_accuracy 0.6 ...}}
@@ -54,6 +55,17 @@ gives:
 holds one slot, Pereira must be filtered OUT of the OTHER slot's pool, so a Rust
 e2e can prove the filtering is real (not just "all-but-A"). Adesanya<->Whittaker
 stays eligible.
+
+  * WEIGHT_CLASSES — the canned weight-class ladder (mirrors the real sidecar's
+    predict.weight_class_ladder(), built FROM MEN_LADDER + WOMEN_LADDER). Each
+    entry is {"name", "gender", "ordinal"}. These are CONSISTENT with DIVISIONS:
+        {"name": "Middleweight", "gender": "M", "ordinal": 6}  # Adesanya + Whittaker
+        {"name": "Heavyweight",  "gender": "M", "ordinal": 8}  # Pereira
+    A fighter "is in" a class C iff their DIVISIONS contain [C.gender, C.ordinal].
+    So selecting "Middleweight" (M#6) surfaces Adesanya + Whittaker; selecting
+    "Heavyweight" (M#8) surfaces only Pereira. This lets a Rust e2e prove the
+    weight-class filter narrows the candidate pool by class membership (and that
+    it composes with the eligibility RULES on the other slot).
 """
 
 import json
@@ -85,6 +97,18 @@ DIVISIONS = {
     "Israel Adesanya": [["M", 6]],   # Middleweight
     "Robert Whittaker": [["M", 6]],  # Middleweight
 }
+
+# Canned weight-class ladder for the "eligibility" command. Mirrors the real
+# sidecar's predict.weight_class_ladder() (built FROM MEN_LADDER + WOMEN_LADDER):
+# each entry is {"name", "gender", "ordinal"}. CONSISTENT with DIVISIONS above so
+# the TUI's weight-class filter is TESTABLE: a fighter "is in" a class C iff their
+# DIVISIONS contain [C.gender, C.ordinal]. Middleweight (M#6) surfaces Adesanya +
+# Whittaker; Heavyweight (M#8) surfaces only Pereira -- so a Rust e2e can prove the
+# class filter narrows the pool by membership AND composes with RULES.
+WEIGHT_CLASSES = [
+    {"name": "Middleweight", "gender": "M", "ordinal": 6},  # Adesanya + Whittaker
+    {"name": "Heavyweight", "gender": "M", "ordinal": 8},   # Pereira
+]
 
 
 def _tale(elo, age, record, reach_in, height_in, stance,
@@ -153,11 +177,15 @@ def handle(req):
     if cmd == "roster":
         return {"id": rid, "ok": True, "fighters": list(ROSTER)}
     if cmd == "eligibility":
-        # Policy RULES + per-fighter DIVISIONS, fetched ONCE at startup. The TUI
-        # filters eligible opponents LOCALLY from these (no per-selection IPC).
+        # Policy RULES + per-fighter DIVISIONS + the WEIGHT_CLASSES ladder, fetched
+        # ONCE at startup. The TUI filters eligible opponents LOCALLY from these
+        # (no per-selection IPC) and offers a weight-class picker over
+        # WEIGHT_CLASSES (a fighter "is in" a class iff its [gender, ordinal] is in
+        # that fighter's DIVISIONS).
         return {"id": rid, "ok": True,
                 "rules": dict(RULES),
-                "divisions": {k: [list(p) for p in v] for k, v in DIVISIONS.items()}}
+                "divisions": {k: [list(p) for p in v] for k, v in DIVISIONS.items()},
+                "weight_classes": [dict(c) for c in WEIGHT_CLASSES]}
     if cmd == "predict":
         a = req.get("a")
         b = req.get("b")

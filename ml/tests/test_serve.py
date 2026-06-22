@@ -249,6 +249,36 @@ def test_eligibility_happy_path():
     # Every fighter in the roster is present.
     assert set(divs.keys()) == {"Middle", "LightHeavy", "WomanBantam", "NoDivision"}
 
+    # WEIGHT_CLASSES: the full ladder, sourced FROM the predict.py ladder constants
+    # (never re-typed), so the TUI's class picker can never drift from gating.
+    assert resp["weight_classes"] == P.weight_class_ladder()
+
+
+def test_eligibility_includes_weight_classes_from_ladder_constants():
+    # The eligibility response must ship ``weight_classes`` ALONGSIDE rules +
+    # divisions, built FROM MEN_LADDER + WOMEN_LADDER (single source). Reconstruct
+    # the expectation straight from the constants so a re-typed name/ordinal fails.
+    state = _divisions_state()
+    resp = S.handle({"id": 26, "cmd": "eligibility"}, state)
+    assert resp["ok"] is True
+    # Still has the original shape (rules + divisions) -- nothing broken.
+    assert "rules" in resp and "divisions" in resp
+
+    classes = resp["weight_classes"]
+    expected = (
+        [{"name": n, "gender": "M", "ordinal": o} for n, o in P.MEN_LADDER.items()]
+        + [{"name": n, "gender": "W", "ordinal": o} for n, o in P.WOMEN_LADDER.items()]
+    )
+    assert classes == expected
+    # Every entry is {"name","gender","ordinal"} with gender in {"M","W"}.
+    for c in classes:
+        assert set(c.keys()) == {"name", "gender", "ordinal"}
+        assert c["gender"] in ("M", "W")
+        assert isinstance(c["ordinal"], int)
+    # Headline classes the stub fixture also cans (consistency with Rust e2e).
+    assert {"name": "Middleweight", "gender": "M", "ordinal": 6} in classes
+    assert {"name": "Heavyweight", "gender": "M", "ordinal": 8} in classes
+
 
 def test_eligibility_response_is_json_serialisable():
     # The wire format must serialise cleanly (lists, ints, strs, bools only).
@@ -260,6 +290,9 @@ def test_eligibility_response_is_json_serialisable():
     assert round_trip["rules"]["max_distance"] == 1
     assert round_trip["rules"]["allow_cross_gender"] is False
     assert round_trip["rules"]["allow_unknown_division"] is True
+    # weight_classes survive the round-trip as {"name","gender","ordinal"} dicts.
+    assert {"name": "Flyweight", "gender": "M", "ordinal": 1} in round_trip["weight_classes"]
+    assert round_trip["weight_classes"] == P.weight_class_ladder()
 
 
 def test_eligibility_without_model_reports_not_trained(empty_state):

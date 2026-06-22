@@ -159,6 +159,33 @@ def eligibility_rules() -> dict:
     }
 
 
+def weight_class_ladder() -> list:
+    """The full weight-class ladder as a JSON-friendly list, sourced from constants.
+
+    Built DIRECTLY from ``MEN_LADDER`` (gender ``"M"``) + ``WOMEN_LADDER`` (gender
+    ``"W"``) -- the division NAMES are NEVER re-typed here; they are read straight
+    from the two ladder dicts that already define gating. This is the single source
+    of truth the sidecar's ``eligibility`` command serialises to the TUI as
+    ``weight_classes`` so the TUI can offer a weight-class picker and filter the
+    fighter pool to those who fought in the chosen class -- WITHOUT hardcoding any
+    division name or membership in Rust.
+
+    A fighter "is in" a class ``C`` iff their ``divisions`` (the persisted
+    ``(gender, ordinal)`` set) contain ``(C["gender"], C["ordinal"])`` -- exactly
+    the (gender, ordinal) identity each entry here carries.
+
+    Returns a list of ``{"name": str, "gender": "M"|"W", "ordinal": int}`` dicts,
+    men's ladder first (ascending ordinal) then women's (ascending ordinal), which
+    matches the order the two ladder dicts declare their divisions.
+    """
+    out = []
+    for name, ordinal in MEN_LADDER.items():
+        out.append({"name": name, "gender": "M", "ordinal": ordinal})
+    for name, ordinal in WOMEN_LADDER.items():
+        out.append({"name": name, "gender": "W", "ordinal": ordinal})
+    return out
+
+
 def division_names(divisions):
     """Convert a set of ``(gender, ordinal)`` tuples to sorted division NAMES.
 
