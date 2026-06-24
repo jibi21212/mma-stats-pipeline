@@ -1,8 +1,0 @@
-streamlit>=1.30
-pandas>=2.0
-
-# The "Fight Predictor" page imports ml/predict.py to load the trained model,
-# which needs scikit-learn + joblib. Install ml/requirements.txt (or just these)
-# if you want that page; the other pages work with streamlit + pandas alone.
-scikit-learn>=1.3
-joblib>=1.2

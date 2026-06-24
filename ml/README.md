@@ -193,8 +193,8 @@ python predict.py --a "Israel Adesanya" --b "Robert Whittaker"   # one predictio
 ```
 
 The trained model is written to `ml/models/predictor.joblib` (gitignored —
-regenerate with `--train`). The Streamlit viewer's **Fight Predictor** page
-loads this file.
+regenerate with `--train`). The TUI's prediction sidecar (`serve.py`) loads this
+file.
 
 ### Three correctness invariants
 
