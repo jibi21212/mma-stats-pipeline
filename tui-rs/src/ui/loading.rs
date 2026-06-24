@@ -76,14 +76,18 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     //   * FINISHED  -> a STILL bar: 100% green "✓ done" (or red "✗ failed" at
     //                  the last-known fill). It must NOT keep animating 0->100.
     //   * RUNNING + parsed "N/M" progress -> a determinate bar at done/total.
-    //   * RUNNING + no progress yet        -> a tasteful indeterminate pulse.
+    //   * RUNNING + no progress yet        -> a monotonic, time-based fill that
+    //                                         climbs and decelerates but NEVER
+    //                                         resets (no more 0->100->0 sweep).
     let (ratio, bar_label, gauge_fg) = match job.status {
         JobStatus::Done => (1.0_f64, "✓ done · 100%".to_string(), Color::Green),
         JobStatus::Failed => {
             // Freeze at whatever fraction was reached; never re-sweep.
             let r = match job.progress {
                 Some((done, total)) if total > 0 => done as f64 / total as f64,
-                _ => 1.0,
+                // No count: freeze the time-based estimate at the elapsed time
+                // captured when the job stopped — don't imply a full bar on failure.
+                _ => anim::indeterminate_progress(job.elapsed_secs() as f64),
             };
             (r, "✗ failed".to_string(), Color::Red)
         }
@@ -94,9 +98,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 Color::Cyan,
             ),
             _ => {
-                // Indeterminate: a slow sweep driven by the animation clock.
-                let pulse = (app.anim_frame() % 30) as f64 / 30.0;
-                (pulse, "working…".to_string(), Color::Cyan)
+                // No N/M count to go on (e.g. model training): a MONOTONIC fill
+                // derived from real elapsed wall-clock time. It climbs and slows,
+                // and never sweeps back to 0 like the old sawtooth did.
+                let ratio = anim::indeterminate_progress(job.started.elapsed().as_secs_f64());
+                (ratio, "working…".to_string(), Color::Cyan)
             }
         },
     };
