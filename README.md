@@ -1,80 +1,87 @@
 # MMA Stats Pipeline
 
-A standalone two-component data pipeline for UFC fight statistics. A fast,
-concurrent **Go scraper** pulls fighter, event, and fight data from
-[ufcstats.com](http://ufcstats.com) into a local SQLite database, and a
-**Python unsupervised-ML** component reads that database to discover fighter
-**archetypes** (clustering) and **stat relationships** (correlations +
-association rules).
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Go 1.26+](https://img.shields.io/badge/Go-1.26+-00ADD8.svg)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg)
+![Rust](https://img.shields.io/badge/Rust-stable-DEA584.svg)
 
-There is no *hosted* web application. The pipeline is these two components plus a
-shared SQLite database on disk; an optional **local** Streamlit viewer (`viewer/`)
-lets you browse the records on demand at `localhost` (nothing is deployed).
+A local, end-to-end toolkit for UFC fight statistics. A concurrent Go scraper
+pulls fighter, event, and fight data from [ufcstats.com](http://ufcstats.com)
+into one SQLite file; a Python ML layer reads it to find fighter archetypes, mine
+stat relationships, and predict fight outcomes; and a Rust terminal UI ties it all
+together as a single control center. Everything runs on your machine — point it at
+a database, scrape, analyse, and run matchups from one screen.
 
-There is also a **terminal UI** (`tui-rs/`) that ties the whole pipeline together:
-launch it and, from one screen, scrape, train/load the fight-outcome model, search
-fighters, and run predictions — all driven by a long-lived Python sidecar so the
-ML model loads once.
+![MMA Stats Pipeline TUI](docs/images/tui-demo.gif)
 
-## Install
+## Features
 
-Install the whole polyglot app (Go scraper + Python ML + Rust TUI) with a single
-command and launch it with `mma`. Both methods **build from source**, so the
-build toolchains below are required. Both also install into a **user-writable
-location** because the Go scraper is the sole writer of the database.
+- **Concurrent, incremental scraper** — pulls fighters, events, and fights from
+  [ufcstats.com](http://ufcstats.com). After the first run it only fetches what's
+  new, throttles its own requests, and clears the site's bot-check automatically.
+- **Fighter archetypes** — groups fighters by fighting style and labels each with a
+  readable name (e.g. *takedown-heavy grappler*, *rangy knockout artist*).
+- **Stat relationships** — finds and charts how fighter stats relate to one another.
+- **Fight-outcome predictor** — estimates the odds of one fighter beating another,
+  at around 60–65% accuracy on held-out fights. You can also:
+  - compare fighters at **any point in their career** — their latest form, their
+    **prime** (their estimated peak), or a specific past fight;
+  - see **win-by-method odds** — decision / KO-TKO / submission — as a breakdown
+    that adds up to 100%.
+- **Terminal UI** — the main way to use the project: fuzzy fighter search, the
+  predictor, plain-English stat explanations, and an animated loading screen. It
+  runs the scraper on demand and loads the prediction model once in the background.
 
-**Prerequisites (build-from-source):**
+## Architecture
 
-- **Rust** (`cargo`) — builds the TUI
-- **Go** — builds the scraper
-- **Python 3** — runs the ML sidecar (a virtualenv is created for you)
-- **git** — only for the `curl | sh` method (clones the repo)
-
-On macOS the easiest way to get all of them is Homebrew:
-`brew install git python rust go`. The installers also detect missing toolchains
-and print copy-paste instructions.
-
-### Option A — Homebrew (macOS)
-
-```sh
-brew tap jibi21212/tap
-brew install mma-stats
-mma
+```
+  you ── launch ─▶  mma  (Rust TUI, tui-rs/)
+                      │ runs          │ predictions      │ reads
+                      ▼               ▼                  ▼ (read-only)
+              ┌─────────────┐  ┌──────────────┐  ┌──────────────┐
+   scrape ──▶ │  Go scraper │─▶│  data/ufc.db │◀─│  Python ML   │
+   ufcstats   │ (scraper-go)│  │   (SQLite)   │  │    (ml/)     │
+              └─────────────┘  └──────────────┘  └──────────────┘
 ```
 
-`go` and `rust` are pulled in automatically as build dependencies and `python`
-as a runtime dependency. On **first run**, `mma` provisions a user-writable
-runtime directory at `${XDG_DATA_HOME:-$HOME/.local/share}/mma-stats` — a Python
-venv with the ML dependencies plus a writable copy of the bundled database — then
-launches the TUI. That one-time step uses the network (Homebrew's build sandbox
-can't), so it happens at first launch, not during `brew install`. Later launches
-are instant.
+You launch one thing — the terminal UI. It runs the scraper when you want fresh
+data, reads the shared SQLite database, and gets predictions from the Python ML
+code. The scraper is the only part that writes the database; everything else opens
+it read-only. The schema both sides rely on is documented in
+[docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
 
-> Status: the tap (`jibi21212/homebrew-tap`) and a public release of this repo
-> must exist for these commands to resolve. The formula and a tap scaffold live
-> in [`packaging/homebrew/`](packaging/homebrew/); see its README for publishing
-> steps and the current honest status.
+## Tech stack & requirements
 
-### Option B — curl | sh (macOS / Linux)
+| Component | Language / runtime | Key libraries |
+|---|---|---|
+| `scraper-go/` | Go 1.26+ (no CGO) | goquery, `golang.org/x/time`, `modernc.org/sqlite` |
+| `ml/` | Python 3.10+ (3.11 tested) | pandas, numpy, scikit-learn, matplotlib, seaborn, mlxtend (umap optional), joblib |
+| `tui-rs/` | Rust (stable) | ratatui, rusqlite, ratatui-image |
+| storage | SQLite (WAL) | shared `data/ufc.db` (committed) |
+
+The trained predictor lives at `ml/models/predictor.joblib` (gitignored);
+regenerate it with `make train`. On macOS the toolchains install in one line:
+
+```sh
+brew install git python rust go
+```
+
+## Installation
+
+Both methods build from source and install into a user-writable location.
+
+### Option A — curl \| sh (macOS / Linux)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jibi21212/mma-stats-pipeline/main/install.sh | sh
-```
-
-This clones the repo into a writable location
-(`~/.local/share/mma-stats-pipeline` by default; override with `$MMA_HOME`), runs
-the build-from-source setup (`scripts/setup.sh`: Python venv + ML deps + native
-binaries), and symlinks the `mma` launcher into `~/.local/bin`. If that directory
-isn't on your `PATH`, the installer tells you the exact line to add. Re-running
-updates the install (`git pull` + incremental rebuild). Then:
-
-```sh
 mma
 ```
 
-### Option C — from a clone (development)
+Clones into `~/.local/share/mma-stats-pipeline` (override with `$MMA_HOME`), builds
+from source, and symlinks the `mma` launcher into `~/.local/bin`. Re-running updates
+the install.
 
-Clone the repo and run the launcher; it self-bootstraps the build on first run:
+### Option B — from a clone (development)
 
 ```sh
 git clone https://github.com/jibi21212/mma-stats-pipeline.git
@@ -82,136 +89,97 @@ cd mma-stats-pipeline
 ./mma          # first run builds from source, then launches
 ```
 
-Or run the setup explicitly (`scripts/setup.sh --install-deps` will `brew
-install` any missing toolchains on macOS). See [Quick start](#quick-start) below
-for the full set of `make` tasks.
+Run `scripts/setup.sh --install-deps` to let the setup `brew install` any missing
+toolchains on macOS.
 
-## Quick start
+## Usage
 
-From the repo root:
+The TUI is the control center — from one screen you can scrape, train or load the
+model, search fighters, and run predictions. From the repo root:
 
 ```sh
-./mma          # launch the TUI (one-time optimized build on first run)
-# or, equivalently:
+./mma          # launch the TUI (one-time optimised build on first run)
 make run       # same thing
-make help      # list every root task
+make help      # list every task
 ```
 
-Other root tasks (all run from here, no `cd` needed):
+Other root tasks:
 
 ```sh
-make build     # optimized TUI binary + Go scraper binary (TUI auto-detects it)
-make test      # run ALL suites: Rust (cargo) + Python (pytest) + Go (go test)
-make e2e       # end-to-end tests: PTY suite + tmux smoke (hermetic, offline)
+make dev       # launch the TUI in debug mode (faster compile)
+make build     # optimised TUI binary + Go scraper binary
 make train     # train / retrain the fight-outcome predictor
+make test      # all suites: Rust (cargo) + Python (pytest) + Go (go test)
+make e2e       # end-to-end tests (PTY suite + tmux smoke; offline)
+make clean     # remove build artifacts
 ```
 
-Prerequisites: Rust (`cargo`), Go, and the Python `.venv` (the TUI uses `.venv/bin/python`
-for its ML sidecar). The TUI itself is the control center — you should not need to run the
-Go scraper or Python ML by hand.
-
-## Architecture
-
-```
-                                  data/ufc.db
-  ┌──────────────┐   scrape    ┌──────────────┐   read-only   ┌──────────────┐
-  │ ufcstats.com │ ──────────▶ │  Go scraper  │ ────────────▶ │  Python ML   │
-  │  (HTML pages)│             │ (scraper-go/)│   SQLite DB   │    (ml/)     │
-  └──────────────┘             └──────┬───────┘               └──────┬───────┘
-                                      │ writes                       │ produces
-                                      ▼                              ▼
-                               ┌──────────────┐              ┌───────────────────┐
-                               │  data/ufc.db │              │ CSV + PNG outputs │
-                               │   (SQLite)   │              │   + Jupyter nb    │
-                               └──────────────┘              └───────────────────┘
-```
-
-- The Go scraper is the **sole writer** of `data/ufc.db`.
-- The Python ML component opens the database **read-only** and never mutates it.
-- The database schema is the contract between the two halves — see
-  [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
-
-## Quickstart
-
-### 1. Build and run the Go scraper to populate `data/ufc.db`
-
-Requires Go 1.26+ (pure-Go SQLite — no gcc/CGO needed).
+### Run components individually (advanced)
 
 ```sh
-cd scraper-go
-go build ./...
-go run . --db ../data/ufc.db
+# Scrape into ../data/ufc.db (incremental by default; --full re-fetches everything)
+cd scraper-go && go run .
+
+# Archetype + relationship analysis -> ml/outputs/ (CSVs + PNGs)
+cd ml && pip install -r requirements.txt && python run_all.py --min-fights 5 --k 6
+
+# Train the predictor, then run a matchup (try --as-of-a prime / --as-of-b prime)
+cd ml && python predict.py --train
+cd ml && python predict.py --a "Israel Adesanya" --b "Robert Whittaker"
 ```
 
-This fetches the fighter index and completed-events listing, then writes
-`fighters`, `events`, `fights`, and `round_stats` into `data/ufc.db` (the parent
-directory is created automatically). Useful flags include `--letter a` (scope to
-one starting letter), `--full` (ignore incremental skip sets), `--limit N` (cap
-events saved), `--concurrency N`, and `--rate N` (aggregate requests/sec). See
-[scraper-go/README.md](scraper-go/README.md) for the full flag list.
+See each component's README for the full flag reference.
 
-### 2. Install the ML dependencies and run the analysis
+## Project structure
 
-Requires Python 3 (pandas, numpy, scikit-learn, matplotlib, etc.).
+```
+mma-stats-pipeline/
+├── mma                      Launcher: builds on first run, then starts the TUI
+├── Makefile                 Root task hub (run / build / test / train / …)
+├── install.sh               curl | sh installer
+├── tui-rs/                  Rust terminal UI (the control center)
+├── scraper-go/              Go scraper — sole writer of data/ufc.db
+├── ml/                      Python ML: archetypes, relationships, predictor
+│   ├── run_all.py           Unsupervised analysis CLI
+│   ├── predict.py           Fight-outcome predictor (+ prime / method probs)
+│   ├── serve.py             Long-lived sidecar the TUI talks to
+│   └── models/              Trained predictor.joblib (gitignored)
+├── data/ufc.db              Shared SQLite database (committed)
+├── scripts/                 setup.sh, verify.py, tui_smoke.sh
+└── docs/SCHEMA_CONTRACT.md  Authoritative DB schema + value conventions
+```
+
+## Data & schema
+
+`data/ufc.db` holds four tables — `fighters`, `events`, `fights`, `round_stats`.
+Conventions: percentages are stored as `0..1` fractions, height/reach in inches,
+weight in lbs, times in seconds, dates as ISO `YYYY-MM-DD`. The full DDL and
+conventions are in [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
+
+## Tests
 
 ```sh
-cd ml
-pip install -r requirements.txt
-python run_all.py --db ../data/ufc.db --outdir ./outputs
+make test                                    # everything
+cd ml && python -m pytest -q                 # Python (run from ml/)
+cd scraper-go && go test ./...               # Go (offline fixtures)
+cargo test --manifest-path tui-rs/Cargo.toml # Rust
 ```
 
-This builds the per-fighter feature matrix, runs both analyses, and writes the
-artifacts into `ml/outputs/` (`fighter_clusters.csv`, `cluster_profiles.csv`,
-`correlations.csv`, `association_rules.csv`, plus PNG charts). To explore the
-same flow interactively, run `jupyter notebook notebook.ipynb` from the `ml/`
-directory. See [ml/README.md](ml/README.md) for details.
-
-### 3. (Optional) Browse the records in a local GUI
-
-```sh
-pip install -r viewer/requirements.txt
-streamlit run viewer/app.py
-```
-
-Opens a **local** Streamlit app at `http://localhost:8501` (not hosted) to browse
-fighters (with fight history + round-by-round stats), events, fights, and the ML
-archetypes/charts. See [viewer/README.md](viewer/README.md).
-
-## Project layout
-
-```
-mma/
-├── scraper-go/                 Go scraper (writes data/ufc.db)
-│   ├── main.go                 CLI entry point + concurrent orchestration
-│   ├── internal/               fetch, parse, model, and store packages
-│   └── README.md               build, run, and flag reference
-├── ml/                         Python unsupervised-ML component (read-only)
-│   ├── db.py                   loaders + feature engineering
-│   ├── archetypes.py           clustering (PCA, KMeans, hierarchical)
-│   ├── relationships.py        correlations + association-rule mining
-│   ├── run_all.py              CLI that runs both analyses
-│   ├── notebook.ipynb          interactive walkthrough
-│   ├── outputs/                generated CSV + PNG artifacts
-│   ├── requirements.txt        Python dependencies
-│   └── README.md               install and run reference
-├── viewer/                     Local Streamlit GUI to browse records (read-only)
-│   ├── app.py                  the viewer app (streamlit run viewer/app.py)
-│   └── README.md               install and run reference
-├── data/                       SQLite database (ufc.db) created at runtime
-└── docs/
-    └── SCHEMA_CONTRACT.md       authoritative DB schema + value conventions
-```
+The Python tests build a synthetic in-memory database, and the Go and Rust suites
+use inline fixtures, so no scraped data is required to run them.
 
 ## Documentation
 
-- [scraper-go/README.md](scraper-go/README.md) — Go scraper: build, run, flags.
-- [ml/README.md](ml/README.md) — Python ML: install, run, outputs.
-- [viewer/README.md](viewer/README.md) — local Streamlit record viewer.
-- [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md) — the shared SQLite schema
-  and value conventions both components rely on.
+- [scraper-go/README.md](scraper-go/README.md) — Go scraper: build, run, flags, anti-bot handling.
+- [ml/README.md](ml/README.md) — Python ML: install, outputs, predictor deep-dive.
+- [tui-rs/README.md](tui-rs/README.md) — terminal UI internals and the sidecar protocol.
+- [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md) — the shared schema both halves rely on.
 
-## Legacy
+## Acknowledgements
 
-The old Django web application has been **moved out of this project** to the sibling
-folder `../mma_legacy_django` (and is also on GitHub). It is fully superseded by this
-pipeline — nothing here depends on it.
+Fight data is scraped from [ufcstats.com](http://ufcstats.com) for personal,
+non-commercial analysis.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
