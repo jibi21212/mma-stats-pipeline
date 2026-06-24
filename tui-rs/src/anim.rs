@@ -16,6 +16,8 @@
 //!   "MMA", framed as a fight poster, fitting within `width` columns. (Kept as
 //!   plain `Vec<String>`; the home screen colors it — do NOT regress it.)
 //! - [`intro_done`]: true once the one-shot intro has fully revealed.
+//! - [`indeterminate_progress`]: a monotonic, non-resetting progress fraction for
+//!   jobs that report no `N/M` count (drives the loading bar's indeterminate arm).
 
 /// The braille spinner cycle, exposed so callers/tests can reason about length.
 pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -140,6 +142,33 @@ pub fn intro_done(frame: usize) -> bool {
     frame >= INTRO_TICKS
 }
 
+// ---------------------------------------------------------------------------
+// Indeterminate progress
+// ---------------------------------------------------------------------------
+
+/// Time constant (seconds) for the indeterminate progress curve: the bar reaches
+/// ~63% at `τ` seconds elapsed, ~86% at `2τ`, ~95% near `3τ`. Tuned so a typical
+/// multi-second job (a model train, a scrape with no per-item count) reads as
+/// "well underway" without ever claiming to be finished. Tweak this ONE number to
+/// make the bar feel snappier (smaller) or more patient (larger).
+const INDETERMINATE_TAU_SECS: f64 = 14.0;
+
+/// Ceiling the running indeterminate bar approaches but never crosses, leaving
+/// visible headroom so the snap to 100% on completion is unmistakable.
+const INDETERMINATE_CEIL: f64 = 0.95;
+
+/// Progress fraction (`0.0..=`[`INDETERMINATE_CEIL`]) for a job that reports NO
+/// `N/M` count, derived from wall-clock `elapsed_secs`. It rises MONOTONICALLY and
+/// never resets — an exponential approach `1 - e^(-t/τ)` that decelerates as it
+/// climbs and is capped below 1.0. Replaces the old `frame % 30` sawtooth that
+/// swept 0→100→0 on a loop. PURE: the same `elapsed_secs` always maps to the same
+/// fraction; the renderer reads the clock and the math stays here, testable.
+pub fn indeterminate_progress(elapsed_secs: f64) -> f64 {
+    let t = elapsed_secs.max(0.0);
+    let approach = 1.0 - (-t / INDETERMINATE_TAU_SECS).exp();
+    approach.min(INDETERMINATE_CEIL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +200,39 @@ mod tests {
         assert!(!intro_done(INTRO_TICKS - 1));
         assert!(intro_done(INTRO_TICKS));
         assert!(intro_done(INTRO_TICKS + 1000));
+    }
+
+    // --- indeterminate_progress -------------------------------------------
+
+    #[test]
+    fn indeterminate_progress_starts_empty_and_never_resets() {
+        // The whole point of the fix: sampled across a long run it only ever goes
+        // UP. The old sawtooth went 0→~1→0 repeatedly; this must not.
+        assert_eq!(indeterminate_progress(0.0), 0.0, "should start empty at t=0");
+        let mut prev = 0.0;
+        let mut t = 0.0;
+        while t <= 120.0 {
+            let cur = indeterminate_progress(t);
+            assert!(cur >= prev, "progress went backwards at t={t}: {cur} < {prev}");
+            prev = cur;
+            t += 0.5;
+        }
+    }
+
+    #[test]
+    fn indeterminate_progress_stays_below_full() {
+        // Always leaves headroom for the completion snap to 100%, even very late,
+        // and clamps negative/zero input to 0.
+        for &t in &[-3.0, 0.0, 5.0, 14.0, 60.0, 600.0, 10_000.0] {
+            let r = indeterminate_progress(t);
+            assert!(
+                (0.0..=INDETERMINATE_CEIL).contains(&r),
+                "out of range at t={t}: {r}"
+            );
+        }
+        // It climbs decisively past the midpoint within a few τ.
+        assert!(indeterminate_progress(INDETERMINATE_TAU_SECS) > 0.5);
+        assert!(indeterminate_progress(10_000.0) >= INDETERMINATE_CEIL - 1e-9);
     }
 
     // --- mma_intro ---------------------------------------------------------
