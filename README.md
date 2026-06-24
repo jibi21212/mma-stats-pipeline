@@ -1,6 +1,6 @@
 # MMA Stats Pipeline
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![License: MIT + Commons Clause](https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause%20(no--sell)-blue.svg)
 ![Go 1.26+](https://img.shields.io/badge/Go-1.26+-00ADD8.svg)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg)
 ![Rust](https://img.shields.io/badge/Rust-stable-DEA584.svg)
@@ -182,4 +182,8 @@ non-commercial analysis.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT License](https://opensource.org/license/mit) with the
+[Commons Clause](https://commonsclause.com/) — see [LICENSE](LICENSE). You're free
+to use, copy, and modify this, but you may **not sell** the software or a paid
+product/service whose value derives substantially from it. (This makes the project
+*source-available*, not OSI open-source.)
