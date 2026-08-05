@@ -9,26 +9,27 @@ A local, end-to-end toolkit for UFC fight statistics. A concurrent Go scraper
 pulls fighter, event, and fight data from [ufcstats.com](http://ufcstats.com)
 into one SQLite file; a Python ML layer reads it to find fighter archetypes, mine
 stat relationships, and predict fight outcomes; and a Rust terminal UI ties it all
-together as a single control center. Everything runs on your machine — point it at
+together as a single control center. Everything runs on your machine - point it at
 a database, scrape, analyse, and run matchups from one screen.
 
 ![MMA Stats Pipeline TUI](docs/images/tui-demo.gif)
 
 ## Features
 
-- **Concurrent, incremental scraper** — pulls fighters, events, and fights from
+- **Concurrent, incremental scraper** - pulls fighters, events, and fights from
   [ufcstats.com](http://ufcstats.com). After the first run it only fetches what's
   new, throttles its own requests, and clears the site's bot-check automatically.
-- **Fighter archetypes** — groups fighters by fighting style and labels each with a
+- **Fighter archetypes** - groups fighters by fighting style and labels each with a
   readable name (e.g. *takedown-heavy grappler*, *rangy knockout artist*).
-- **Stat relationships** — finds and charts how fighter stats relate to one another.
-- **Fight-outcome predictor** — estimates the odds of one fighter beating another,
-  at around 60–65% accuracy on held-out fights. You can also:
-  - compare fighters at **any point in their career** — their latest form, their
+- **Stat relationships** - finds and charts how fighter stats relate to one another.
+- **Fight-outcome predictor** - estimates the odds of one fighter beating another,
+  at around 60-65% accuracy on held-out fights. You can also:
+  - compare fighters at **any point in their career** - their latest form, their
     **prime** (their estimated peak), or a specific past fight;
-  - see **win-by-method odds** — decision / KO-TKO / submission — as a breakdown
-    that adds up to 100%.
-- **Terminal UI** — the main way to use the project: fuzzy fighter search, the
+  - see **win-by-method odds** - decision / KO-TKO / submission - as a breakdown
+    that adds up to 100%;
+  - predict every fight on the next scraped upcoming card from the TUI.
+- **Terminal UI** - the main way to use the project: fuzzy fighter search, the
   predictor, plain-English stat explanations, and an animated loading screen. It
   runs the scraper on demand and loads the prediction model once in the background.
 
@@ -36,19 +37,20 @@ a database, scrape, analyse, and run matchups from one screen.
 
 ```
   you ── launch ─▶  mma  (Rust TUI, tui-rs/)
-                      │ runs          │ predictions      │ reads
-                      ▼               ▼                  ▼ (read-only)
+              │ runs on demand │ reads directly  │ spawns once,
+              ▼                ▼ (read-only)     ▼ (JSON lines)
               ┌─────────────┐  ┌──────────────┐  ┌──────────────┐
-   scrape ──▶ │  Go scraper │─▶│  data/ufc.db │◀─│  Python ML   │
+   scrape ──▶ │  Go scraper │─▶│  data/ufc.db │─▶│  Python ML   │
    ufcstats   │ (scraper-go)│  │   (SQLite)   │  │    (ml/)     │
               └─────────────┘  └──────────────┘  └──────────────┘
 ```
 
-You launch one thing — the terminal UI. It runs the scraper when you want fresh
-data, reads the shared SQLite database, and gets predictions from the Python ML
-code. The scraper is the only part that writes the database; everything else opens
-it read-only. The schema both sides rely on is documented in
-[docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
+You launch one thing - the terminal UI. It runs the scraper when you want fresh
+data, reads the shared SQLite database directly (read-only), and gets predictions
+from the Python ML sidecar, which also reads the database. The scraper is the only
+part that writes it. `data/ufc.db` itself is gitignored, not checked into the repo -
+run the scraper (or `make dev`) to build your own local copy. The schema both sides
+rely on is documented in [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
 
 ## Tech stack & requirements
 
@@ -57,7 +59,7 @@ it read-only. The schema both sides rely on is documented in
 | `scraper-go/` | Go 1.26+ (no CGO) | goquery, `golang.org/x/time`, `modernc.org/sqlite` |
 | `ml/` | Python 3.10+ (3.11 tested) | pandas, numpy, scikit-learn, matplotlib, seaborn, mlxtend (umap optional), joblib |
 | `tui-rs/` | Rust (stable) | ratatui, rusqlite, ratatui-image |
-| storage | SQLite (WAL) | shared `data/ufc.db` (committed) |
+| storage | SQLite (WAL) | shared `data/ufc.db` (gitignored, built locally) |
 
 The trained predictor lives at `ml/models/predictor.joblib` (gitignored);
 regenerate it with `make train`. On macOS the toolchains install in one line:
@@ -70,7 +72,7 @@ brew install git python rust go
 
 Both methods build from source and install into a user-writable location.
 
-### Option A — curl \| sh (macOS / Linux)
+### Option A - curl \| sh (macOS / Linux)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jibi21212/mma-stats-pipeline/main/install.sh | sh
@@ -81,7 +83,7 @@ Clones into `~/.local/share/mma-stats-pipeline` (override with `$MMA_HOME`), bui
 from source, and symlinks the `mma` launcher into `~/.local/bin`. Re-running updates
 the install.
 
-### Option B — from a clone (development)
+### Option B - from a clone (development)
 
 ```sh
 git clone https://github.com/jibi21212/mma-stats-pipeline.git
@@ -94,7 +96,7 @@ toolchains on macOS.
 
 ## Usage
 
-The TUI is the control center — from one screen you can scrape, train or load the
+The TUI is the control center - from one screen you can scrape, train or load the
 model, search fighters, and run predictions. From the repo root:
 
 ```sh
@@ -138,20 +140,20 @@ mma-stats-pipeline/
 ├── Makefile                 Root task hub (run / build / test / train / …)
 ├── install.sh               curl | sh installer
 ├── tui-rs/                  Rust terminal UI (the control center)
-├── scraper-go/              Go scraper — sole writer of data/ufc.db
+├── scraper-go/              Go scraper - sole writer of data/ufc.db
 ├── ml/                      Python ML: archetypes, relationships, predictor
 │   ├── run_all.py           Unsupervised analysis CLI
 │   ├── predict.py           Fight-outcome predictor (+ prime / method probs)
 │   ├── serve.py             Long-lived sidecar the TUI talks to
 │   └── models/              Trained predictor.joblib (gitignored)
-├── data/ufc.db              Shared SQLite database (committed)
+├── data/ufc.db              Shared SQLite database (gitignored, built locally)
 ├── scripts/                 setup.sh, verify.py, tui_smoke.sh
 └── docs/SCHEMA_CONTRACT.md  Authoritative DB schema + value conventions
 ```
 
 ## Data & schema
 
-`data/ufc.db` holds four tables — `fighters`, `events`, `fights`, `round_stats`.
+`data/ufc.db` holds four tables - `fighters`, `events`, `fights`, `round_stats`.
 Conventions: percentages are stored as `0..1` fractions, height/reach in inches,
 weight in lbs, times in seconds, dates as ISO `YYYY-MM-DD`. The full DDL and
 conventions are in [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
@@ -170,10 +172,10 @@ use inline fixtures, so no scraped data is required to run them.
 
 ## Documentation
 
-- [scraper-go/README.md](scraper-go/README.md) — Go scraper: build, run, flags, anti-bot handling.
-- [ml/README.md](ml/README.md) — Python ML: install, outputs, predictor deep-dive.
-- [tui-rs/README.md](tui-rs/README.md) — terminal UI internals and the sidecar protocol.
-- [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md) — the shared schema both halves rely on.
+- [scraper-go/README.md](scraper-go/README.md) - Go scraper: build, run, flags, anti-bot handling.
+- [ml/README.md](ml/README.md) - Python ML: install, outputs, predictor deep-dive.
+- [tui-rs/README.md](tui-rs/README.md) - terminal UI internals and the sidecar protocol.
+- [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md) - the shared schema both halves rely on.
 
 ## Acknowledgements
 
@@ -183,7 +185,7 @@ non-commercial analysis.
 ## License
 
 [MIT License](https://opensource.org/license/mit) with the
-[Commons Clause](https://commonsclause.com/) — see [LICENSE](LICENSE). You're free
+[Commons Clause](https://commonsclause.com/) - see [LICENSE](LICENSE). You're free
 to use, copy, and modify this, but you may **not sell** the software or a paid
 product/service whose value derives substantially from it. (This makes the project
 *source-available*, not OSI open-source.)
