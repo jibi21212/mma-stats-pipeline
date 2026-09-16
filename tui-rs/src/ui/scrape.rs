@@ -5,9 +5,9 @@
 //!
 //! This screen renders ONLY the option chips + how-to-run guidance. While a
 //! scrape JOB is in flight (`App.job` is `Some`), `ui::mod::draw` swaps the whole
-//! body for the loading overlay (`ui::loading`) — fighters animation, braille
-//! spinner, elapsed time, progress bar, and the live process log — so the live
-//! run UI is handled there, not here. The toggle state lives on `App.scrape`
+//! body for the loading overlay (`ui::loading`) - spinner, elapsed time, progress
+//! bar, and the live process log - so the live run UI is handled there, not here.
+//! The toggle state lives on `App.scrape`
 //! (Foundation); key handling (f / +/- / [ ] / c / Enter / r) lives in
 //! `app::on_key_scrape`. This file stays thin and pure.
 
@@ -25,7 +25,7 @@ use crate::app::{App, ScrapeState};
 /// Layout (top to bottom): the chip row, a blank spacer, a per-option legend,
 /// and a "press Enter/r to run" call-to-action. Everything reads `app.scrape`.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let lines = body_lines(&app.scrape);
+    let lines = body_lines(&app.scrape, &app.scrape_traces_status);
     let p = Paragraph::new(lines)
         .block(titled_block("Scraper options"))
         .wrap(Wrap { trim: false });
@@ -33,8 +33,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Build the full set of styled lines for the screen body from the option state.
-fn body_lines(s: &ScrapeState) -> Vec<Line<'static>> {
-    vec![
+fn body_lines(s: &ScrapeState, traces: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::raw(""),
         chip_row(s),
         Line::raw(""),
@@ -57,7 +57,22 @@ fn body_lines(s: &ScrapeState) -> Vec<Line<'static>> {
         run_call_to_action(),
         Line::raw(""),
         explainer(s),
-    ]
+    ];
+    if !traces.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(traces_line(traces));
+    }
+    lines
+}
+
+/// Dim one-liner: Jaeger+file vs file-only, refreshed when entering this screen.
+fn traces_line(status: &str) -> Line<'static> {
+    Line::styled(
+        status.to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )
 }
 
 /// The single row of three option chips, separated by spacing.
@@ -122,7 +137,7 @@ fn run_call_to_action() -> Line<'static> {
         ),
         Span::raw("  "),
         Span::styled(
-            "start scraping — fighters spar in the overlay while it runs",
+            "start scraping",
             Style::default().fg(Color::Gray),
         ),
     ])
@@ -246,12 +261,25 @@ mod tests {
     fn body_lines_render_without_panicking() {
         // Smoke: both an all-defaults and an all-set state produce a non-empty
         // body. (Pure check; no Frame needed.)
-        assert!(!body_lines(&ScrapeState::default()).is_empty());
+        assert!(!body_lines(&ScrapeState::default(), "").is_empty());
         let set = ScrapeState {
             full: true,
             limit: Some(100),
             rate: Some(1.5),
         };
-        assert!(!body_lines(&set).is_empty());
+        assert!(!body_lines(&set, "").is_empty());
+    }
+
+    #[test]
+    fn body_lines_include_traces_status_when_present() {
+        let lines = body_lines(
+            &ScrapeState::default(),
+            "traces: file only (Jaeger not reachable on :4318)",
+        );
+        let joined: String = lines.iter().map(|l| l.to_string()).collect();
+        assert!(
+            joined.contains("traces: file only (Jaeger not reachable on :4318)"),
+            "scrape UI should show the traces status line, got:\n{joined}"
+        );
     }
 }

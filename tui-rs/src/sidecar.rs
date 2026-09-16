@@ -62,6 +62,9 @@ impl Sidecar {
             SidecarLaunch::Executable(exe) => Command::new(exe),
         };
         command.current_dir(&cfg.ml_dir);
+        let otel = crate::otel::ChildOtel::for_sidecar(&cfg.repo_root);
+        otel.ensure_file_dir();
+        otel.apply(&mut command);
         Sidecar::from_command(command).with_context(|| {
             format!(
                 "failed to start ML sidecar: {:?} (cwd {})",

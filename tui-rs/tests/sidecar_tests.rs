@@ -23,7 +23,9 @@
 //! - a sidecar that exits without answering is handled gracefully (an `Err`, no
 //!   panic / hang).
 
-// Mirror the crate's module tree so `crate::config` / `crate::models` resolve.
+// Mirror the crate's module tree so `crate::config` / `crate::models` / `crate::otel` resolve.
+#[path = "../src/otel.rs"]
+mod otel;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/models.rs"]

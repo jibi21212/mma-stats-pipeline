@@ -47,6 +47,7 @@ where
     F: FnMut(&str),
 {
     let mut command = build_command(&cfg.scraper, opts, db_flag(cfg).as_deref());
+    attach_otel(&mut command, &cfg.repo_root);
     run_command(&mut command, on_line)
 }
 
@@ -81,8 +82,13 @@ pub fn run_async(cfg: &Config, opts: &ScrapeOptions) -> std::sync::mpsc::Receive
     let launch = cfg.scraper.clone();
     let db = db_flag(cfg);
     let opts = opts.clone();
+    let repo_root = cfg.repo_root.clone();
     thread::spawn(move || {
         let mut command = build_command(&launch, &opts, db.as_deref());
+        let traces = attach_otel(&mut command, &repo_root);
+        if !traces.is_empty() {
+            let _ = tx.send(JobMsg::Line(traces));
+        }
         let success = match run_command(&mut command, |line| {
             // Forward progress events first when the line encodes them.
             if let Some((done, total)) = parse_progress(line) {
@@ -171,6 +177,16 @@ fn build_command(launch: &ScraperLaunch, opts: &ScrapeOptions, db: Option<&Path>
     };
     append_flags(&mut command, opts, db);
     command
+}
+
+/// Enable OpenTelemetry on the scraper child and return the scrape-UI status
+/// line (`traces: Jaeger …` / `traces: file only …`). Empty when the user opted
+/// out (`MMA_OTEL=0` or `OTEL_SDK_DISABLED=true`).
+fn attach_otel(command: &mut Command, repo_root: &Path) -> String {
+    let otel = crate::otel::ChildOtel::for_scraper(repo_root);
+    otel.ensure_file_dir();
+    otel.apply(command);
+    otel.status_line
 }
 
 /// Append the option-derived CLI flags to `command` (shared by both launch
@@ -400,7 +416,15 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["--db", "/writable/ufc.db", "--full", "--limit", "25", "--rate", "4.5"]
+            vec![
+                "--db",
+                "/writable/ufc.db",
+                "--full",
+                "--limit",
+                "25",
+                "--rate",
+                "4.5"
+            ]
         );
     }
 
@@ -439,7 +463,10 @@ mod tests {
             ..Default::default()
         };
         let cfg = Config::resolve(std::path::PathBuf::from("/tmp/repo"), &env);
-        assert_eq!(db_flag(&cfg), Some(std::path::PathBuf::from("/writable/ufc.db")));
+        assert_eq!(
+            db_flag(&cfg),
+            Some(std::path::PathBuf::from("/writable/ufc.db"))
+        );
     }
 
     #[test]
@@ -537,5 +564,59 @@ mod tests {
             cmd.get_current_dir().map(|p| p.to_path_buf()),
             Some(std::path::PathBuf::from("/tmp/scraper-go"))
         );
+    }
+
+    fn command_env(cmd: &Command) -> std::collections::HashMap<String, String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrape_command_gets_otel_file_env_without_metrics() {
+        // The spawn Command must carry MMA_OTEL + JSONL path even when Jaeger
+        // is down, and must never opt into MMA_OTEL_METRICS (Jaeger 404s it).
+        use crate::otel::{ChildOtel, ProcessOtelEnv};
+
+        let cfg = Config::resolve(
+            std::path::PathBuf::from("/tmp/repo"),
+            &crate::config::EnvVars::default(),
+        );
+        let mut cmd = build_command(&cfg.scraper, &ScrapeOptions::default(), None);
+        let otel = ChildOtel::scraper_with(&cfg.repo_root, &ProcessOtelEnv::default(), false);
+        otel.apply(&mut cmd);
+        let envs = command_env(&cmd);
+        assert_eq!(envs.get("OTEL_SERVICE_NAME").map(String::as_str), Some("mma-scraper"));
+        assert_eq!(envs.get("MMA_OTEL").map(String::as_str), Some("1"));
+        assert_eq!(
+            envs.get("MMA_OTEL_FILE").map(String::as_str),
+            Some("/tmp/repo/telemetry/runs/tui-scraper.jsonl")
+        );
+        assert!(!envs.contains_key("OTEL_EXPORTER_OTLP_ENDPOINT"));
+        assert!(!envs.contains_key("MMA_OTEL_METRICS"));
+    }
+
+    #[test]
+    fn scrape_command_sets_otlp_endpoint_when_collector_reachable() {
+        use crate::otel::{ChildOtel, ProcessOtelEnv, DEFAULT_OTLP_ENDPOINT};
+
+        let cfg = Config::resolve(
+            std::path::PathBuf::from("/tmp/repo"),
+            &crate::config::EnvVars::default(),
+        );
+        let mut cmd = build_command(&cfg.scraper, &ScrapeOptions::default(), None);
+        let otel = ChildOtel::scraper_with(&cfg.repo_root, &ProcessOtelEnv::default(), true);
+        otel.apply(&mut cmd);
+        let envs = command_env(&cmd);
+        assert_eq!(
+            envs.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some(DEFAULT_OTLP_ENDPOINT)
+        );
+        assert!(!envs.contains_key("MMA_OTEL_METRICS"));
     }
 }

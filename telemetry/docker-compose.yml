@@ -1,9 +1,21 @@
+# Local Jaeger all-in-one for MMA pipeline traces (OTLP :4317/:4318, UI :16686).
+#
+# Default all-in-one storage is in-memory and is wiped by `docker compose down`.
+# Badger on a bind mount keeps spans across `make telemetry-down` / `telemetry-up`
+# so a scrape is still visible after a restart. `docker compose down` without `-v`
+# does not delete this directory. Wipe with: rm -rf telemetry/jaeger-data
 services:
   jaeger:
     image: jaegertracing/all-in-one:1.68.0
     container_name: mma-jaeger
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+    volumes:
+      - ./jaeger-data:/badger
     ports:
       - "16686:16686" # UI
       - "4317:4317"   # OTLP gRPC

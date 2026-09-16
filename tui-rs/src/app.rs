@@ -376,6 +376,9 @@ pub struct App {
     pub event_fights: EventFightsState,
     pub scrape: ScrapeState,
     pub model: ModelState,
+    /// Live scrape-telemetry status (`traces: Jaeger :16686 + file` or file-only).
+    /// Refreshed when entering the Scrape screen and again at scrape spawn.
+    pub scrape_traces_status: String,
 }
 
 impl App {
@@ -405,6 +408,7 @@ impl App {
             event_fights: EventFightsState::default(),
             scrape: ScrapeState::default(),
             model: ModelState::default(),
+            scrape_traces_status: String::new(),
         };
 
         app.refresh_db_summary();
@@ -470,6 +474,7 @@ impl App {
                 self.recompute_predict_candidates();
             }
             Screen::Model => self.refresh_model_status(),
+            Screen::Scrape => self.refresh_scrape_traces_status(),
             _ => {}
         }
     }
@@ -1127,10 +1132,17 @@ impl App {
             limit: self.scrape.limit,
             rate: self.scrape.rate,
         };
+        self.refresh_scrape_traces_status();
         let mut job = jobs::spawn_scrape(&self.config, &opts);
         job.push_log("$ starting scraper...".to_string());
         self.job = Some(job);
         self.status_line = Some("Scraping...".to_string());
+    }
+
+    /// Probe local Jaeger and cache the one-line traces status for the Scrape UI.
+    fn refresh_scrape_traces_status(&mut self) {
+        self.scrape_traces_status =
+            crate::otel::ChildOtel::for_scraper(&self.config.repo_root).status_line;
     }
 
     // ======================================================================= //

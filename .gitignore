@@ -30,6 +30,9 @@ ml/models/
 telemetry/runs/
 otel-spans.jsonl
 
+# Jaeger Badger data (persists across telemetry-down/up; wipe by deleting this dir)
+telemetry/jaeger-data/
+
 # Local-only personal study notes (not shared)
 notes/
 

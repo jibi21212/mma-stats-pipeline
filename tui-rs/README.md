@@ -22,6 +22,9 @@ builds are fast.)
   for the roster, model status, and fight predictions over JSON lines. All ML
   math lives in Python; the TUI never reimplements it.
 - **Runs** the Go scraper on demand and streams its progress into a log pane.
+  Traces: `make telemetry-up`, then `make` (or `./mma`), scrape inside the TUI,
+  then `make telemetry-open` (Jaeger search for `mma-scraper`; click **Find Traces**
+  if the page still looks empty). No extra env vars. Sidecar: service `mma-sidecar`.
 
 ## Loading animation (terminal graphics)
 
@@ -70,6 +73,7 @@ train one (training writes `ml/models/predictor.joblib`).
 | `src/db.rs`         | Read-only SQLite queries → `models` structs.                |
 | `src/sidecar.rs`    | Client for the Python ML sidecar (JSON lines).              |
 | `src/scraper.rs`    | Spawns + streams the Go scraper.                            |
+| `src/otel.rs`       | OTel env injected into scraper/sidecar children.            |
 | `src/stats_text.rs` | Plain-English stat explanations (the "layman layer").       |
 | `src/fuzzy.rs`      | Fuzzy fighter-name narrowing.                               |
 | `src/app.rs`        | App state + screens + update/transition logic.              |

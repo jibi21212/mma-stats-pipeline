@@ -159,7 +159,9 @@ impl Sidecar {
 impl Drop for Sidecar { /* kills the child */ }
 ```
 `ok:false` responses map to `Err(...)`. Requests get monotonically increasing ids;
-read response lines until the matching `id` is seen.
+read response lines until the matching `id` is seen. Spawn may inject OpenTelemetry
+env (`OTEL_SERVICE_NAME=mma-sidecar`, `MMA_OTEL`, `MMA_OTEL_FILE`, and OTLP when
+`:4318` is up). **JSON lines are unchanged.**
 
 ### `src/scraper.rs`
 ```rust
@@ -170,6 +172,10 @@ where F: FnMut(&str);
 ```
 Maps `full→--full`, `limit→--limit N`, `rate→--rate R`. `on_line` is called per
 streamed output line (stdout+stderr merged, newline-stripped). Blocks to exit.
+The TUI enables OpenTelemetry on the scraper child (`OTEL_SERVICE_NAME=mma-scraper`,
+`MMA_OTEL=1`, `MMA_OTEL_FILE=<repo>/telemetry/runs/tui-scraper.jsonl`, and
+`OTEL_EXPORTER_OTLP_ENDPOINT` when `:4318` is reachable). Never sets
+`MMA_OTEL_METRICS`. This is spawn env, not IPC.
 
 ### `src/stats_text.rs`
 ```rust
