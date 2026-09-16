@@ -14,3 +14,8 @@ jupyter>=1.0
 # Optional: UMAP is import-guarded in archetypes.py and is NEVER a hard dependency.
 # Uncomment to enable a UMAP 2-D projection alongside the PCA scatter.
 # umap-learn>=0.5
+
+# OpenTelemetry (opt-in via MMA_OTEL / MMA_OTEL_FILE / OTEL_EXPORTER_OTLP_ENDPOINT)
+opentelemetry-api>=1.27
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp-proto-http>=1.27

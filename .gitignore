@@ -26,6 +26,10 @@ ml/outputs/
 # Trained fight-outcome predictor (regenerate: cd ml && python predict.py --train)
 ml/models/
 
+# OpenTelemetry span dumps from measurement runs
+telemetry/runs/
+otel-spans.jsonl
+
 # Local-only personal study notes (not shared)
 notes/
 

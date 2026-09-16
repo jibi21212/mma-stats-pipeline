@@ -11,14 +11,17 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"go.opentelemetry.io/otel/attribute"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite"
 
 	"ufcscraper/internal/model"
+	"ufcscraper/internal/telemetry"
 )
 
 // Store wraps the database and the single-writer machinery.
@@ -167,7 +170,18 @@ ON CONFLICT(name) DO UPDATE SET
 
 // UpsertFighter inserts or updates one fighter by name, on the writer goroutine.
 func (s *Store) UpsertFighter(f model.Fighter) error {
-	return s.submit(func() error {
+	return s.UpsertFighterCtx(context.Background(), f)
+}
+
+// UpsertFighterCtx is UpsertFighter with a parent trace context so the load
+// span nests under the caller's extract/transform unit of work.
+func (s *Store) UpsertFighterCtx(ctx context.Context, f model.Fighter) error {
+	ctx, span := telemetry.StartLoad(ctx, "fighter",
+		attribute.String("fighter.name", f.Name),
+	)
+	defer span.End()
+
+	err := s.submit(func() error {
 		_, err := s.db.Exec(fighterUpsertSQL,
 			f.Name, f.Nickname, f.Nationality, f.HeightIn, f.WeightLbs, f.ReachIn, f.Stance,
 			f.DOB, f.Wins, f.Losses, f.Draws, f.NoContests,
@@ -178,6 +192,12 @@ func (s *Store) UpsertFighter(f model.Fighter) error {
 		}
 		return nil
 	})
+	if err != nil {
+		telemetry.RecordError(span, err)
+		return err
+	}
+	telemetry.AddRecords(ctx, "fighter", 1)
+	return nil
 }
 
 // SaveEvent persists an entire event — the events row, every fights row, and
@@ -187,7 +207,25 @@ func (s *Store) UpsertFighter(f model.Fighter) error {
 // winner already exists in fighters; per the contract we do not create
 // placeholder fighter rows for card-only names).
 func (s *Store) SaveEvent(ev model.Event) error {
-	return s.submit(func() (err error) {
+	return s.SaveEventCtx(context.Background(), ev)
+}
+
+// SaveEventCtx is SaveEvent with a parent trace context so the load span
+// nests under the caller's event unit of work. The write still runs on the
+// single writer goroutine.
+func (s *Store) SaveEventCtx(ctx context.Context, ev model.Event) error {
+	nRounds := 0
+	for _, fight := range ev.Fights {
+		nRounds += len(fight.Competitor1.Rounds) + len(fight.Competitor2.Rounds)
+	}
+	ctx, span := telemetry.StartLoad(ctx, "event",
+		attribute.String("event.title", ev.Title),
+		attribute.Int("etl.fight_count", len(ev.Fights)),
+		attribute.Int("etl.round_count", nRounds),
+	)
+	defer span.End()
+
+	err := s.submit(func() (err error) {
 		tx, err := s.db.Begin()
 		if err != nil {
 			return fmt.Errorf("begin tx for event %q: %w", ev.Title, err)
@@ -219,6 +257,14 @@ func (s *Store) SaveEvent(ev model.Event) error {
 
 		return tx.Commit()
 	})
+	if err != nil {
+		telemetry.RecordError(span, err)
+		return err
+	}
+	telemetry.AddRecords(ctx, "event", 1)
+	telemetry.AddRecords(ctx, "fight", int64(len(ev.Fights)))
+	telemetry.AddRecords(ctx, "round_stat", int64(nRounds))
+	return nil
 }
 
 // insertFight writes one fight row, its two competitors' round_stats rows, and

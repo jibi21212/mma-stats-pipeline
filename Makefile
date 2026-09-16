@@ -7,7 +7,7 @@ CARGO    ?= cargo
 MANIFEST := $(ROOT)/tui-rs/Cargo.toml
 
 .DEFAULT_GOAL := run
-.PHONY: run dev build test e2e train clean help
+.PHONY: run dev build test e2e train clean help telemetry-up telemetry-down
 
 run: ## Launch the TUI (release binary; builds once if needed)
 	@"$(ROOT)/mma"
@@ -34,6 +34,12 @@ train: ## Train / retrain the fight-outcome predictor model
 clean: ## Remove build artifacts (Rust target + Go scraper binary)
 	$(CARGO) clean --manifest-path "$(MANIFEST)"
 	rm -f "$(ROOT)/scraper-go/scraper"
+
+telemetry-up: ## Start local Jaeger all-in-one (OTLP 4317/4318, UI :16686)
+	docker compose -f "$(ROOT)/telemetry/docker-compose.yml" up -d
+
+telemetry-down: ## Stop local Jaeger
+	docker compose -f "$(ROOT)/telemetry/docker-compose.yml" down
 
 help: ## Show available targets
 	@echo "MMA Stats Pipeline — run any of these from the repo root:"

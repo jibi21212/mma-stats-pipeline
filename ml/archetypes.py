@@ -43,6 +43,7 @@ from sklearn.metrics import silhouette_score  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
 
 from db import DEFAULT_DB_PATH, build_fighter_features  # noqa: E402
+import telemetry  # noqa: E402
 
 # A few human-friendly stats surfaced in fighter_clusters.csv.
 _KEY_STATS = [
@@ -320,6 +321,28 @@ def run_archetypes(
         Summary with ``best_k``, ``n_fighters``, ``n_pca_components``,
         ``files`` (list of written paths) and ``profiles`` (DataFrame).
     """
+    attrs = {"ml.k_min": k_min, "ml.k_max": k_max}
+    if k is not None:
+        attrs["ml.k"] = int(k)
+    with telemetry.span("ml.cluster", attrs) as sp:
+        result = _run_archetypes_impl(
+            db_path=db_path, outdir=outdir, features=features,
+            k_min=k_min, k_max=k_max, variance=variance, k=k,
+        )
+        sp.set_attribute("ml.best_k", int(result["best_k"]))
+        sp.set_attribute("ml.n_fighters", int(result["n_fighters"]))
+        return result
+
+
+def _run_archetypes_impl(
+    db_path: Optional[str] = None,
+    outdir: str = "outputs",
+    features: Optional[pd.DataFrame] = None,
+    k_min: int = 2,
+    k_max: int = 8,
+    variance: float = 0.95,
+    k: Optional[int] = None,
+) -> dict:
     _ensure_outdir(outdir)
     if features is None:
         features = build_fighter_features(db_path=db_path)

@@ -23,6 +23,7 @@ import os
 import sys
 
 from db import DEFAULT_DB_PATH, build_fighter_features
+import telemetry
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -71,6 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
+    telemetry.setup(service_name="mma-ml")
 
     # Import the heavy stages lazily so `--help` works without the deps, and so
     # any missing-DB error surfaces with a clear message rather than a stack
@@ -88,60 +90,63 @@ def main(argv=None) -> int:
     print(f"  outdir   : {outdir}")
     print()
 
-    # --- 1) Features ------------------------------------------------------- #
-    try:
-        fb_kwargs = {}
-        if args.min_fights is not None:
-            fb_kwargs["min_fights"] = args.min_fights
-        if args.all_fighters:
-            fb_kwargs["require_round_data"] = False
-        features = build_fighter_features(db_path=args.db, **fb_kwargs)
-    except FileNotFoundError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 3
+    with telemetry.span("ml.run_all"):
+        # --- 1) Features --------------------------------------------------- #
+        try:
+            fb_kwargs = {}
+            if args.min_fights is not None:
+                fb_kwargs["min_fights"] = args.min_fights
+            if args.all_fighters:
+                fb_kwargs["require_round_data"] = False
+            with telemetry.span("ml.features"):
+                features = build_fighter_features(db_path=args.db, **fb_kwargs)
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 3
 
-    print(f"[1/3] Built feature matrix: {features.shape[0]} fighters x "
-          f"{features.shape[1]} features.")
+        print(f"[1/3] Built feature matrix: {features.shape[0]} fighters x "
+              f"{features.shape[1]} features.")
 
-    # --- 2) Archetypes ----------------------------------------------------- #
-    arche = run_archetypes(
-        outdir=outdir, features=features, k_min=args.k_min, k_max=args.k_max, k=args.k
-    )
-    print(f"[2/3] Archetype clustering: k={arche['best_k']} clusters "
-          f"({arche['n_pca_components']} PCA components, "
-          f"{arche['explained_variance'] * 100:.1f}% variance retained).")
-    if args.k is None and arche["best_k"] <= 2:
-        print("      hint: silhouette is flat for fighter stats (styles are a "
-              "continuum); try --k 6 for finer, more interpretable archetypes.")
+        # --- 2) Archetypes ------------------------------------------------- #
+        arche = run_archetypes(
+            outdir=outdir, features=features, k_min=args.k_min, k_max=args.k_max, k=args.k
+        )
+        print(f"[2/3] Archetype clustering: k={arche['best_k']} clusters "
+              f"({arche['n_pca_components']} PCA components, "
+              f"{arche['explained_variance'] * 100:.1f}% variance retained).")
+        if args.k is None and arche["best_k"] <= 2:
+            print("      hint: silhouette is flat for fighter stats (styles are a "
+                  "continuum); try --k 6 for finer, more interpretable archetypes.")
 
-    # --- 3) Relationships -------------------------------------------------- #
-    rel = run_relationships(outdir=outdir, features=features)
-    print(f"[3/3] Relationship mining: {rel['n_rules']} association rules "
-          f"above thresholds.")
+        # --- 3) Relationships ---------------------------------------------- #
+        with telemetry.span("ml.relationships"):
+            rel = run_relationships(outdir=outdir, features=features)
+        print(f"[3/3] Relationship mining: {rel['n_rules']} association rules "
+              f"above thresholds.")
 
-    # --- Report ------------------------------------------------------------ #
-    all_files = list(arche["files"]) + list(rel["files"])
-    print()
-    print("-" * 70)
-    print("Outputs written:")
-    for path in all_files:
-        rel_path = os.path.relpath(path, start=os.getcwd())
-        print(f"  - {rel_path}")
-    print("-" * 70)
+        # --- Report -------------------------------------------------------- #
+        all_files = list(arche["files"]) + list(rel["files"])
+        print()
+        print("-" * 70)
+        print("Outputs written:")
+        for path in all_files:
+            rel_path = os.path.relpath(path, start=os.getcwd())
+            print(f"  - {rel_path}")
+        print("-" * 70)
 
-    # A quick peek at the discovered archetypes.
-    profiles = arche.get("profiles")
-    if profiles is not None and "archetype_label" in profiles.columns:
-        print("Suggested archetypes:")
-        for cl, row in profiles.iterrows():
-            print(f"  cluster {cl} (n={int(row['size'])}): "
-                  f"{row['archetype_label']}")
-    print()
-    print("Done.")
-    return 0
+        # A quick peek at the discovered archetypes.
+        profiles = arche.get("profiles")
+        if profiles is not None and "archetype_label" in profiles.columns:
+            print("Suggested archetypes:")
+            for cl, row in profiles.iterrows():
+                print(f"  cluster {cl} (n={int(row['size'])}): "
+                      f"{row['archetype_label']}")
+        print()
+        print("Done.")
+        return 0
 
 
 if __name__ == "__main__":

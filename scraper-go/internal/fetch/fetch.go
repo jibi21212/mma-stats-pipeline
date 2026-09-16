@@ -41,6 +41,8 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/time/rate"
+
+	"ufcscraper/internal/telemetry"
 )
 
 // Client wraps a shared *http.Client (with a cookie jar) and a rate limiter. One
@@ -92,19 +94,27 @@ const maxPoWIterations = 1 << 26
 // parsed goquery document. Fail-soft: any failure returns an error the caller
 // logs and skips rather than panicking.
 func (c *Client) GetDoc(ctx context.Context, rawURL string) (*goquery.Document, error) {
+	ctx, span := telemetry.StartExtract(ctx, rawURL)
+	defer span.End()
+
 	body, err := c.getBody(ctx, rawURL)
 	if err != nil {
+		telemetry.RecordError(span, err)
 		return nil, err
 	}
 	if isChallenge(body) {
 		body, err = c.clearChallenge(ctx, rawURL, body)
 		if err != nil {
-			return nil, fmt.Errorf("anti-bot challenge for %s: %w", rawURL, err)
+			err = fmt.Errorf("anti-bot challenge for %s: %w", rawURL, err)
+			telemetry.RecordError(span, err)
+			return nil, err
 		}
 	}
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", rawURL, err)
+		err = fmt.Errorf("parse %s: %w", rawURL, err)
+		telemetry.RecordError(span, err)
+		return nil, err
 	}
 	return doc, nil
 }
