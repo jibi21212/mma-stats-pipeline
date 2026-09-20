@@ -119,12 +119,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hints = if app.job_active() {
         match app.job_status() {
-            Some(s) if s.is_finished() => "Esc/⏎ dismiss · Home · q Quit",
-            _ => "running… · q Quit",
+            Some(s) if s.is_finished() => "Esc/⏎ dismiss · Home · ^Q q",
+            _ => "running… · ^Q q",
         }
     } else {
         app.current().footer_hint()
     };
+    let hints = if app.prefix_armed { "^Q-" } else { hints };
     let p = Paragraph::new(Line::from(Span::styled(
         format!(" {hints}"),
         Style::default().fg(Color::DarkGray),

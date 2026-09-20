@@ -38,3 +38,6 @@ notes/
 
 # Local Claude Code guidance (kept out of version control)
 CLAUDE.md
+
+# stackgraph
+.stackgraph/

@@ -430,6 +430,48 @@ fn load_events_most_recent_first_nulls_last() {
 }
 
 #[test]
+fn next_upcoming_event_chooses_nearest_future_card() {
+    let tmp = TempDb::new();
+    {
+        let conn = Connection::open(&tmp.path).expect("open temp db for future events");
+        conn.execute(
+            "INSERT INTO events (event_id, title, date, location)
+             VALUES (4, 'UFC Far Future', '2099-03-01', 'Future City')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (event_id, title, date, location)
+             VALUES (5, 'UFC Next', '2099-01-10', 'Soon City')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (event_id, title, date, location)
+             VALUES (6, 'UFC Same Day Later Insert', '2099-01-10', 'Tie City')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = tmp.open();
+    let ev = db
+        .next_upcoming_event_on_or_after("2099-01-01")
+        .unwrap()
+        .expect("future event");
+    assert_eq!(ev.title, "UFC Same Day Later Insert");
+    assert_eq!(ev.date.as_deref(), Some("2099-01-10"));
+}
+
+#[test]
+fn next_upcoming_event_returns_none_when_only_past_or_undated() {
+    let tmp = TempDb::new();
+    let db = tmp.open();
+    let ev = db.next_upcoming_event_on_or_after("2099-01-01").unwrap();
+    assert!(ev.is_none());
+}
+
+#[test]
 fn fights_for_fighter_matches_winner_or_loser() {
     let tmp = TempDb::new();
     let db = tmp.open();

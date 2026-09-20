@@ -215,6 +215,74 @@ pub struct PredictResult {
     /// Name of the best model, e.g. `"logreg"` / `"gboost"`.
     pub model: Option<String>,
     pub test_accuracy: Option<f64>,
+    /// Which snapshot each side used, e.g. `"current"` / `"prime (2021-03-06)"`.
+    /// `#[serde(default)]` so an older sidecar (no labels) still deserializes.
+    #[serde(default)]
+    pub snap_a_label: Option<String>,
+    #[serde(default)]
+    pub snap_b_label: Option<String>,
+    /// Coherent JOINT win-method distribution (six values sum to 1), or `None` on
+    /// a legacy payload that predates the method base rate.
+    #[serde(default)]
+    pub method_probs: Option<MethodSplit>,
+}
+
+/// One fighter's win-by-method probabilities (the `a` or `b` half of a
+/// [`MethodSplit`]). Each is a JOINT probability (already multiplied by that
+/// fighter's win probability), so `decision + ko_tko + submission == P(win)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodProbs {
+    pub decision: Option<f64>,
+    pub ko_tko: Option<f64>,
+    pub submission: Option<f64>,
+}
+
+/// The full coherent joint win-method distribution for a matchup: the six values
+/// across `a` and `b` sum to 1 (modulo unmodelled draw/NC mass). Mirrors
+/// `predict.method_split()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodSplit {
+    pub a: MethodProbs,
+    pub b: MethodProbs,
+    /// The empirical-Bayes shrinkage strength used (shown in the UI).
+    #[serde(default)]
+    pub kappa: Option<f64>,
+}
+
+/// A snapshot SELECTOR: which career snapshot of a fighter to use for a
+/// prediction. Untagged so it serializes exactly as Python expects:
+/// `"prime"` (a bare string anchor), `{"fight_id":123}`, or `{"date":"2019-10-05"}`.
+/// `None` (the request field omitted entirely) means the default current snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SnapSelector {
+    /// `"current"` / `"latest"` / `"prime"`.
+    Anchor(String),
+    /// A specific past fight by its `fight_id`.
+    Fight { fight_id: i64 },
+    /// The most recent snapshot on/before an ISO `YYYY-MM-DD` date.
+    Date { date: String },
+}
+
+/// One selectable career snapshot of a fighter (the `timeline` command payload
+/// items). Metadata only — the heavy feature vectors stay in Python. Mirrors
+/// `predict.available_snapshots()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub index: i64,
+    pub fight_id: Option<i64>,
+    /// ISO `YYYY-MM-DD`.
+    pub date: String,
+    pub opponent: String,
+    /// `"w"` / `"l"` — the fighter's result in that fight.
+    pub result: String,
+    pub weight_class: Option<String>,
+    /// Record GOING INTO that fight, e.g. `"6-0"`.
+    pub record: String,
+    pub elo: Option<f64>,
+    pub win_streak: i64,
+    /// Whether this is the fighter's computed prime fight.
+    pub is_prime: bool,
 }
 
 // =========================================================================== //
@@ -250,7 +318,20 @@ pub enum SidecarCommand {
     /// (`divisions`) ONCE at startup. Thereafter the TUI filters eligible
     /// opponents LOCALLY (no per-selection round-trip).
     Eligibility,
-    Predict { a: String, b: String },
+    /// `snap_a`/`snap_b` are OPTIONAL snapshot selectors; when both are omitted
+    /// (`skip_serializing_if`) the request is byte-identical to the old predict.
+    Predict {
+        a: String,
+        b: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snap_a: Option<SnapSelector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snap_b: Option<SnapSelector>,
+    },
+    /// Fetch a fighter's selectable career snapshots (for the snapshot picker).
+    Timeline {
+        name: String,
+    },
     Reload,
 }
 
@@ -290,6 +371,13 @@ pub struct RosterPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictPayload {
     pub result: PredictResult,
+}
+
+/// Typed payload for `timeline`: a fighter's selectable career snapshots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelinePayload {
+    pub name: String,
+    pub snapshots: Vec<SnapshotMeta>,
 }
 
 /// Typed payload for `reload`.
@@ -479,7 +567,14 @@ mod tests {
     fn weight_class_deserializes_python_object_shape() {
         let wc: WeightClass =
             serde_json::from_str(r#"{"name":"Flyweight","gender":"M","ordinal":1}"#).unwrap();
-        assert_eq!(wc, super::WeightClass { name: "Flyweight".into(), gender: Gender::Men, ordinal: 1 });
+        assert_eq!(
+            wc,
+            super::WeightClass {
+                name: "Flyweight".into(),
+                gender: Gender::Men,
+                ordinal: 1
+            }
+        );
     }
 
     #[test]
@@ -545,5 +640,132 @@ mod tests {
         // No divisions -> in no class.
         let none: [Division; 0] = [];
         assert!(!fighter_in_class(&none, &lhw));
+    }
+
+    // --- New snapshot/method IPC types: serde must match Python's wire form ---- //
+
+    #[test]
+    fn snap_selector_serializes_untagged() {
+        assert_eq!(
+            serde_json::to_string(&SnapSelector::Anchor("prime".into())).unwrap(),
+            "\"prime\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapSelector::Fight { fight_id: 5 }).unwrap(),
+            r#"{"fight_id":5}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapSelector::Date {
+                date: "2019-10-05".into()
+            })
+            .unwrap(),
+            r#"{"date":"2019-10-05"}"#
+        );
+        // ...and deserializes back from each shape.
+        assert_eq!(
+            serde_json::from_str::<SnapSelector>("\"prime\"").unwrap(),
+            SnapSelector::Anchor("prime".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<SnapSelector>(r#"{"fight_id":5}"#).unwrap(),
+            SnapSelector::Fight { fight_id: 5 }
+        );
+    }
+
+    #[test]
+    fn predict_request_omits_snap_fields_when_none() {
+        // The pinned compact predict line must be byte-identical when no selector
+        // is set (skip_serializing_if), so existing IPC framing assertions hold.
+        let req = SidecarRequest {
+            id: 1,
+            cmd: SidecarCommand::Predict {
+                a: "A".into(),
+                b: "B".into(),
+                snap_a: None,
+                snap_b: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"id":1,"cmd":"predict","a":"A","b":"B"}"#
+        );
+    }
+
+    #[test]
+    fn predict_request_includes_snap_fields_when_set() {
+        let req = SidecarRequest {
+            id: 2,
+            cmd: SidecarCommand::Predict {
+                a: "A".into(),
+                b: "B".into(),
+                snap_a: Some(SnapSelector::Anchor("prime".into())),
+                snap_b: Some(SnapSelector::Fight { fight_id: 7 }),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"id":2,"cmd":"predict","a":"A","b":"B","snap_a":"prime","snap_b":{"fight_id":7}}"#
+        );
+    }
+
+    #[test]
+    fn timeline_request_serializes() {
+        let req = SidecarRequest {
+            id: 3,
+            cmd: SidecarCommand::Timeline {
+                name: "Jon Jones".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"id":3,"cmd":"timeline","name":"Jon Jones"}"#
+        );
+    }
+
+    #[test]
+    fn predict_result_deserializes_without_new_fields() {
+        // An older sidecar that omits snap labels + method_probs must still parse
+        // (serde default) -> the new fields are None.
+        let r: PredictResult = serde_json::from_str(
+            r#"{"name_a":"A","name_b":"B","allowed":true,"reason":null,
+                "prob_a":0.6,"prob_b":0.4,"distance":0,"model":"logreg",
+                "test_accuracy":0.6}"#,
+        )
+        .unwrap();
+        assert!(r.snap_a_label.is_none());
+        assert!(r.method_probs.is_none());
+    }
+
+    #[test]
+    fn predict_result_deserializes_with_method_probs() {
+        let r: PredictResult = serde_json::from_str(
+            r#"{"name_a":"A","name_b":"B","allowed":true,"reason":null,
+                "prob_a":0.58,"prob_b":0.42,"distance":0,"model":"logreg",
+                "test_accuracy":0.6,"snap_a_label":"prime (2021-03-06)",
+                "snap_b_label":"current",
+                "method_probs":{"a":{"decision":0.3,"ko_tko":0.25,"submission":0.03},
+                                "b":{"decision":0.22,"ko_tko":0.17,"submission":0.03},
+                                "kappa":6.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.snap_a_label.as_deref(), Some("prime (2021-03-06)"));
+        let mp = r.method_probs.unwrap();
+        assert_eq!(mp.a.decision, Some(0.3));
+        assert_eq!(mp.b.ko_tko, Some(0.17));
+        assert_eq!(mp.kappa, Some(6.0));
+    }
+
+    #[test]
+    fn snapshot_meta_deserializes_python_shape() {
+        let m: SnapshotMeta = serde_json::from_str(
+            r#"{"index":6,"fight_id":4619,"date":"2019-10-05",
+                "opponent":"Robert Whittaker","result":"w",
+                "weight_class":"Middleweight Bout","record":"6-0","elo":1606.0,
+                "win_streak":6,"is_prime":true}"#,
+        )
+        .unwrap();
+        assert_eq!(m.fight_id, Some(4619));
+        assert!(m.is_prime);
+        assert_eq!(m.win_streak, 6);
     }
 }

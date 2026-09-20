@@ -15,8 +15,9 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{Config, SidecarLaunch};
 use crate::models::{
-    EligibilityPayload, PredictPayload, PredictResult, ReloadPayload, RosterPayload, SidecarCommand,
-    SidecarRequest, SidecarResponse, StatusPayload,
+    EligibilityPayload, PredictPayload, PredictResult, ReloadPayload, RosterPayload,
+    SidecarCommand, SidecarRequest, SidecarResponse, SnapSelector, SnapshotMeta, StatusPayload,
+    TimelinePayload,
 };
 
 /// A running sidecar process plus the plumbing to talk to it.
@@ -145,16 +146,39 @@ impl Sidecar {
         Ok(payload)
     }
 
-    /// Send `{"cmd":"predict","a":a,"b":b}`; returns the parsed prediction.
-    /// Errors (from `ok:false`) when the model is missing or a name is unknown.
-    pub fn predict(&mut self, a: &str, b: &str) -> Result<PredictResult> {
+    /// Send `{"cmd":"predict","a":a,"b":b, snap_a?, snap_b?}`; returns the parsed
+    /// prediction. `snap_a`/`snap_b` pick which career snapshot of each fighter to
+    /// use (`None` = current/latest); when both are `None` the request is
+    /// byte-identical to the original predict. Errors (from `ok:false`) when the
+    /// model is missing or a name is unknown.
+    pub fn predict(
+        &mut self,
+        a: &str,
+        b: &str,
+        snap_a: Option<SnapSelector>,
+        snap_b: Option<SnapSelector>,
+    ) -> Result<PredictResult> {
         let resp = self.request(SidecarCommand::Predict {
             a: a.to_string(),
             b: b.to_string(),
+            snap_a,
+            snap_b,
         })?;
         let payload: PredictPayload = serde_json::from_value(resp.payload)
             .context("malformed predict payload from sidecar")?;
         Ok(payload.result)
+    }
+
+    /// Send `{"cmd":"timeline","name":name}`; returns the fighter's selectable
+    /// career snapshots (oldest first, the computed prime flagged). Errors (from
+    /// `ok:false`) when the model is not trained.
+    pub fn timeline(&mut self, name: &str) -> Result<Vec<SnapshotMeta>> {
+        let resp = self.request(SidecarCommand::Timeline {
+            name: name.to_string(),
+        })?;
+        let payload: TimelinePayload = serde_json::from_value(resp.payload)
+            .context("malformed timeline payload from sidecar")?;
+        Ok(payload.snapshots)
     }
 
     /// Send `{"cmd":"reload"}`; asks the sidecar to re-read the model from disk

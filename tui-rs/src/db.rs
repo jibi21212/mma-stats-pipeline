@@ -294,6 +294,32 @@ impl Db {
         }))
     }
 
+    /// The next scheduled event in the DB: earliest non-empty date on or after
+    /// SQLite's local current date. Used by the Predict screen's whole-card
+    /// action. Returns `None` when the scraped DB has no future-dated events.
+    pub fn next_upcoming_event(&self) -> Result<Option<EventRow>> {
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events \
+             WHERE date IS NOT NULL AND date <> '' AND date >= date('now','localtime') \
+             ORDER BY date ASC, event_id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt.query_row([], map_event).optional()?)
+    }
+
+    /// Deterministic variant of [`Self::next_upcoming_event`] for tests and
+    /// callers that already have an ISO `YYYY-MM-DD` cutoff.
+    #[cfg(test)]
+    pub fn next_upcoming_event_on_or_after(&self, today_iso: &str) -> Result<Option<EventRow>> {
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events \
+             WHERE date IS NOT NULL AND date <> '' AND date >= ?1 \
+             ORDER BY date ASC, event_id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt.query_row([today_iso], map_event).optional()?)
+    }
+
     /// DB-wide counts and date span for Home / Model screens.
     pub fn summary(&self) -> Result<DbSummary> {
         let n_fighters: i64 = self

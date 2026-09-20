@@ -8,14 +8,14 @@
 //! show up the moment the user dismisses the finished log and lands back here.
 //!
 //! Reads only `app.model` (`ModelState`, populated by `App::refresh_model_status`
-//! from `sidecar.status()`). Key handling (t/Enter train, l reload, r refresh)
-//! lives in `app::on_key_model`; this file is render-only.
+//! from `sidecar.status()`). Key handling (^Q t/Enter train, ^Q l reload, ^Q r
+//! refresh) lives in `app::on_key_model`; this file is render-only.
 
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
+use ratatui::Frame;
 
 use super::titled_block;
 use crate::app::App;
@@ -84,9 +84,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(action("t / ⏎", "train the model (streams in the overlay)"));
-    lines.push(action("l", "reload the on-disk model into the sidecar"));
-    lines.push(action("r", "refresh status from the sidecar"));
+    lines.push(action(
+        "^Q t / ⏎",
+        "train the model (streams in the overlay)",
+    ));
+    lines.push(action("^Q l", "reload the on-disk model into the sidecar"));
+    lines.push(action("^Q r", "refresh status from the sidecar"));
 
     let p = Paragraph::new(lines)
         .block(titled_block("Model status"))
@@ -109,7 +112,7 @@ fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
             )),
             Line::raw(""),
             Line::from(Span::styled(
-                "Press t (or Enter) to train the model. Metrics appear here once",
+                "Press ^Q t (or Enter) to train the model. Metrics appear here once",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(

@@ -8,14 +8,14 @@
 //! body for the loading overlay (`ui::loading`) - spinner, elapsed time, progress
 //! bar, and the live process log - so the live run UI is handled there, not here.
 //! The toggle state lives on `App.scrape`
-//! (Foundation); key handling (f / +/- / [ ] / c / Enter / r) lives in
+//! (Foundation); key handling (^Q f / +/- / [ ] / ^Q c / Enter / ^Q r) lives in
 //! `app::on_key_scrape`. This file stays thin and pure.
 
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::Frame;
 
 use super::titled_block;
 use crate::app::{App, ScrapeState};
@@ -23,7 +23,7 @@ use crate::app::{App, ScrapeState};
 /// Render the Scrape screen into `area`.
 ///
 /// Layout (top to bottom): the chip row, a blank spacer, a per-option legend,
-/// and a "press Enter/r to run" call-to-action. Everything reads `app.scrape`.
+/// and a "press Enter / ^Q r to run" call-to-action. Everything reads `app.scrape`.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let lines = body_lines(&app.scrape, &app.scrape_traces_status);
     let p = Paragraph::new(lines)
@@ -40,7 +40,7 @@ fn body_lines(s: &ScrapeState, traces: &str) -> Vec<Line<'static>> {
         Line::raw(""),
         section("Adjust the next run"),
         legend(
-            "f",
+            "^Q f",
             &format!("toggle full re-scrape (now {})", on_off(s.full)),
         ),
         legend(
@@ -51,7 +51,7 @@ fn body_lines(s: &ScrapeState, traces: &str) -> Vec<Line<'static>> {
             "[ / ]",
             &format!("slow / speed up rate by 0.5 (now {})", rate_text(s.rate)),
         ),
-        legend("c", "clear the log from the last finished run"),
+        legend("^Q c", "clear the log from the last finished run"),
         Line::raw(""),
         section("Run"),
         run_call_to_action(),
@@ -129,17 +129,14 @@ fn legend(key: &str, desc: &str) -> Line<'static> {
 fn run_call_to_action() -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            "  Enter / r ",
+            "  Enter / ^Q r ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(
-            "start scraping",
-            Style::default().fg(Color::Gray),
-        ),
+        Span::styled("start scraping", Style::default().fg(Color::Gray)),
     ])
 }
 
@@ -160,7 +157,11 @@ fn explainer(s: &ScrapeState) -> Line<'static> {
 
 /// "ON" / "OFF" for a boolean flag.
 fn on_off(active: bool) -> &'static str {
-    if active { "ON" } else { "OFF" }
+    if active {
+        "ON"
+    } else {
+        "OFF"
+    }
 }
 
 /// Chip text for the full-rescrape toggle: "Full: ON" / "Full: OFF".

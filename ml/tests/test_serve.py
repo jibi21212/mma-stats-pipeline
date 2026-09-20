@@ -125,7 +125,7 @@ def test_roster_absent_reports_not_trained(empty_state):
 def test_predict_happy_path(loaded_state, monkeypatch):
     captured = {}
 
-    def fake_predict(a, b, path=None):
+    def fake_predict(a, b, path=None, snap_a=None, snap_b=None):
         captured["args"] = (a, b, path)
         return {
             "name_a": a, "name_b": b, "allowed": True, "reason": None,
@@ -163,7 +163,7 @@ def test_predict_missing_fields(loaded_state):
 # --------------------------------------------------------------------------- #
 
 def test_predict_unknown_fighter(loaded_state, monkeypatch):
-    def fake_predict(a, b, path=None):
+    def fake_predict(a, b, path=None, snap_a=None, snap_b=None):
         return {"name_a": a, "name_b": b, "allowed": False,
                 "reason": f"unknown fighter: {a}", "prob_a": None,
                 "prob_b": None}
@@ -179,7 +179,7 @@ def test_predict_unknown_fighter(loaded_state, monkeypatch):
 def test_predict_gating_refusal_is_ok_true_result(loaded_state, monkeypatch):
     # A gating refusal (not unknown fighter) is a successful response whose
     # result carries allowed=False -- the TUI shows the reason from the result.
-    def fake_predict(a, b, path=None):
+    def fake_predict(a, b, path=None, snap_a=None, snap_b=None):
         return {"name_a": a, "name_b": b, "allowed": False,
                 "reason": "too far apart in weight class", "prob_a": None,
                 "prob_b": None, "distance": 5}
@@ -190,6 +190,77 @@ def test_predict_gating_refusal_is_ok_true_result(loaded_state, monkeypatch):
     assert resp["ok"] is True
     assert resp["result"]["allowed"] is False
     assert "too far apart" in resp["result"]["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# predict snapshot selectors (snap_a/snap_b) + timeline command
+# --------------------------------------------------------------------------- #
+
+def test_predict_passes_snapshot_selectors(loaded_state, monkeypatch):
+    captured = {}
+
+    def fake_predict(a, b, path=None, snap_a=None, snap_b=None):
+        captured["snap_a"] = snap_a
+        captured["snap_b"] = snap_b
+        return {"name_a": a, "name_b": b, "allowed": True, "reason": None,
+                "prob_a": 0.5, "prob_b": 0.5}
+
+    monkeypatch.setattr(P, "predict", fake_predict)
+    resp = S.handle({"id": 30, "cmd": "predict", "a": "Alice", "b": "Bob",
+                     "snap_a": "prime", "snap_b": {"fight_id": 5}}, loaded_state)
+    assert resp["ok"] is True
+    assert captured["snap_a"] == "prime"
+    assert captured["snap_b"] == {"fight_id": 5}
+
+
+def test_predict_omitted_selectors_are_none(loaded_state, monkeypatch):
+    captured = {}
+
+    def fake_predict(a, b, path=None, snap_a=None, snap_b=None):
+        captured["snap_a"], captured["snap_b"] = snap_a, snap_b
+        return {"name_a": a, "name_b": b, "allowed": True, "prob_a": 0.5, "prob_b": 0.5}
+
+    monkeypatch.setattr(P, "predict", fake_predict)
+    S.handle({"id": 31, "cmd": "predict", "a": "Alice", "b": "Bob"}, loaded_state)
+    assert captured["snap_a"] is None and captured["snap_b"] is None
+
+
+def test_predict_garbage_selector_is_ok_false(loaded_state):
+    # A malformed selector is rejected BEFORE predict() is called (no crash).
+    resp = S.handle({"id": 32, "cmd": "predict", "a": "Alice", "b": "Bob",
+                     "snap_a": 123}, loaded_state)
+    assert resp["ok"] is False
+    assert "selector" in resp["error"]
+
+
+def test_timeline_command(loaded_state, monkeypatch):
+    canned = [
+        {"index": 0, "fight_id": 1, "date": "2018-01-01", "opponent": "X",
+         "result": "w", "weight_class": "Lightweight Bout", "record": "0-0",
+         "elo": 1500.0, "win_streak": 0, "is_prime": False},
+        {"index": 1, "fight_id": 2, "date": "2019-01-01", "opponent": "Y",
+         "result": "w", "weight_class": "Lightweight Bout", "record": "1-0",
+         "elo": 1515.0, "win_streak": 1, "is_prime": True},
+    ]
+    monkeypatch.setattr(P, "available_snapshots", lambda name, path=None: canned)
+    resp = S.handle({"id": 33, "cmd": "timeline", "name": "Alice"}, loaded_state)
+    assert resp["ok"] is True
+    assert resp["name"] == "Alice"
+    assert resp["snapshots"] == canned
+    # Whole response serialises cleanly (compact-line guarantee).
+    assert "NaN" not in json.dumps(resp, allow_nan=False)
+
+
+def test_timeline_without_model_reports_not_trained(empty_state):
+    resp = S.handle({"id": 34, "cmd": "timeline", "name": "Alice"}, empty_state)
+    assert resp["ok"] is False
+    assert "not trained" in resp["error"]
+
+
+def test_timeline_missing_name(loaded_state):
+    resp = S.handle({"id": 35, "cmd": "timeline"}, loaded_state)
+    assert resp["ok"] is False
+    assert "name" in resp["error"]
 
 
 # --------------------------------------------------------------------------- #
@@ -412,7 +483,7 @@ def test_sanitize_output_is_json_serialisable_without_allow_nan():
 def test_predict_response_nan_becomes_null(loaded_state, monkeypatch):
     # End-to-end: predict() returns NaN tale-of-the-tape values; the response
     # must serialise to valid JSON with nulls (no NaN tokens).
-    def fake_predict(a, b, path=None):
+    def fake_predict(a, b, path=None, snap_a=None, snap_b=None):
         return {
             "name_a": a, "name_b": b, "allowed": True, "reason": None,
             "prob_a": 0.55, "prob_b": 0.45,

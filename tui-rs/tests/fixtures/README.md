@@ -46,17 +46,17 @@ Down=`\x1b[B`, Left=`\x1b[D`, Right=`\x1b[C`, Tab=`\t`, Ctrl-C=`\x03`.
 
 ### `stub_sidecar.py`
 
-Roster (sorted, 3 fighters):
+Roster (sorted, 4 fighters):
 
 ```
-["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]
+["Alex Pereira", "Israel Adesanya", "Joaquin Buckley", "Robert Whittaker"]
 ```
 
 - `ping`   -> `{"ok": true}`
-- `status` -> `model_loaded: true`, `n_fighters: 3`,
+- `status` -> `model_loaded: true`, `n_fighters: 4`,
   `metrics: {"test_accuracy": 0.6}`, `model_path: "<stub>/predictor.joblib"`
-- `roster` -> the 3 names above
-- `reload` -> `model_loaded: true`, `n_fighters: 3`
+- `roster` -> the 4 names above
+- `reload` -> `model_loaded: true`, `n_fighters: 4`
 - `predict` (any two of the roster) -> deterministic ALLOWED result:
   - `prob_a: 0.62`, `prob_b: 0.38`
   - `allowed: true`, `reason: null`, `low_confidence: false`, `distance: 0`

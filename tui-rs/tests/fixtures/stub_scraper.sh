@@ -11,9 +11,9 @@
 #
 # STREAMING IS OBSERVABLE BY DESIGN: a small sleep is inserted between lines so
 # the run takes a beat (~1.2s total). This is what lets the e2e / tmux tests
-# prove the redesign's NON-BLOCKING event loop — while the scraper is still
-# emitting lines the TUI must keep ticking (advancing the fighters animation +
-# braille spinner) and surface each line PROGRESSIVELY rather than all at once.
+# prove the redesign's NON-BLOCKING event loop - while the scraper is still
+# emitting lines the TUI must keep ticking (advancing the spinner/progress strip)
+# and surface each line PROGRESSIVELY rather than all at once.
 # The delay is short enough to keep the suite fast but long enough that a poller
 # on a 100ms tick reliably catches the mid-run state.
 #

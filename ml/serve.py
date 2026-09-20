@@ -17,8 +17,15 @@ Requests each carry an integer ``id`` and a string ``cmd``:
     {"id":N,"cmd":"status"}
     {"id":N,"cmd":"roster"}
     {"id":N,"cmd":"eligibility"}
-    {"id":N,"cmd":"predict","a":"<name>","b":"<name>"}
+    {"id":N,"cmd":"predict","a":"<name>","b":"<name>",
+     "snap_a":<selector>,"snap_b":<selector>}   # snap_* OPTIONAL (see below)
+    {"id":N,"cmd":"timeline","name":"<name>"}
     {"id":N,"cmd":"reload"}
+
+A snapshot ``<selector>`` picks WHICH career snapshot of a fighter to use and is
+one of: omitted/``null``/``"current"`` (default = latest version), ``"prime"``,
+``{"fight_id":<int>}``, or ``{"date":"YYYY-MM-DD"}``. They are additive: a request
+that omits ``snap_a``/``snap_b`` is byte-identical to the old predict request.
 
 Responses echo the same ``id`` and carry an ``ok`` boolean:
     ok:    {"id":N,"ok":true, ...payload}
@@ -56,7 +63,16 @@ Payloads:
                   (gender, ordinal) identities in ``weight_classes``.
                   (ok:false "model not trained" when no model is loaded.)
     predict    -> {"ok":true,"result":{...predict() dict, NaN/Inf -> null...}}
-                  (ok:false if no model / unknown fighter)
+                  The result carries ``prob_a``/``prob_b``, the per-fighter tale of
+                  the tape, ``snap_a_label``/``snap_b_label`` (which snapshot each
+                  side used), and ``method_probs`` (a coherent JOINT win-method
+                  distribution {"a":{decision,ko_tko,submission},"b":{...}} or null
+                  on a legacy payload). (ok:false if no model / unknown fighter.)
+    timeline   -> {"ok":true,"name":str,"snapshots":[{index,fight_id,date,opponent,
+                  result,weight_class,record,elo,win_streak,is_prime}, ...]}
+                  The selectable career snapshots for a fighter, oldest first, with
+                  the computed prime flagged. (ok:false "model not trained" / unknown
+                  fighter returns an empty list.)
     reload     -> {"ok":true,"model_loaded":bool,"n_fighters":int}
 
 LIFECYCLE
@@ -94,6 +110,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 import predict  # noqa: E402  (local module; path set above)
+import telemetry  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +211,32 @@ def sanitize(obj):
 _MODEL_NOT_TRAINED = "model not trained"
 
 
+def _coerce_selector(v):
+    """Validate/normalise a wire snapshot selector.
+
+    Returns ``(selector, error)``: ``selector`` is what ``predict.predict`` accepts
+    (``None`` / ``"current"`` / ``"latest"`` / ``"prime"`` / ``{"fight_id":int}`` /
+    ``{"date":str}``); ``error`` is a message string when the wire value is garbage
+    (so the handler can return ok:false instead of crashing).
+    """
+    if v is None:
+        return None, None
+    if isinstance(v, str):
+        if v in ("current", "latest", "prime"):
+            return v, None
+        return None, f"invalid snapshot selector string: {v!r}"
+    if isinstance(v, dict):
+        if "fight_id" in v:
+            try:
+                return {"fight_id": int(v["fight_id"])}, None
+            except (TypeError, ValueError):
+                return None, "snapshot selector 'fight_id' must be an integer"
+        if "date" in v and isinstance(v["date"], str):
+            return {"date": v["date"]}, None
+        return None, "snapshot selector object needs 'fight_id' or 'date'"
+    return None, "snapshot selector must be a string or object"
+
+
 def _status_payload(state: State) -> dict:
     return {
         "ok": True,
@@ -290,6 +333,20 @@ def handle(request: dict, state: State) -> dict:
             "weight_classes": predict.weight_class_ladder(),
         })
 
+    if cmd == "timeline":
+        if not state.model_loaded:
+            return err(_MODEL_NOT_TRAINED)
+        name = request.get("name")
+        if not isinstance(name, str) or not name:
+            return err("timeline requires a string field 'name'")
+        try:
+            snaps = predict.available_snapshots(name, path=state.model_path)
+        except FileNotFoundError:
+            return err(_MODEL_NOT_TRAINED)
+        except Exception as exc:  # pragma: no cover - defensive
+            return err(f"timeline failed: {exc}")
+        return ok({"ok": True, "name": name, "snapshots": sanitize(snaps)})
+
     if cmd == "predict":
         if not state.model_loaded:
             return err(_MODEL_NOT_TRAINED)
@@ -297,8 +354,17 @@ def handle(request: dict, state: State) -> dict:
         b = request.get("b")
         if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
             return err("predict requires string fields 'a' and 'b'")
+        sel_a, sel_a_err = _coerce_selector(request.get("snap_a"))
+        if sel_a_err:
+            return err(sel_a_err)
+        sel_b, sel_b_err = _coerce_selector(request.get("snap_b"))
+        if sel_b_err:
+            return err(sel_b_err)
         try:
-            result = predict.predict(a, b, path=state.model_path)
+            with telemetry.span("ml.sidecar.predict",
+                                {"ml.fighter_a": a, "ml.fighter_b": b}):
+                result = predict.predict(a, b, path=state.model_path,
+                                         snap_a=sel_a, snap_b=sel_b)
         except FileNotFoundError:
             # Model vanished between load and call -> report not trained.
             return err(_MODEL_NOT_TRAINED)
@@ -394,6 +460,7 @@ def serve(stdin=None, stdout=None, state: State | None = None) -> int:
 
 
 def main(argv=None) -> int:
+    telemetry.setup(service_name="mma-sidecar")
     return serve()
 
 
