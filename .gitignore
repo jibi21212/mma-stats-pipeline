@@ -41,3 +41,6 @@ CLAUDE.md
 
 # stackgraph
 .stackgraph/
+# Local Nix flake leftover from stackgraph bootstrap
+flake.nix
+flake.lock
