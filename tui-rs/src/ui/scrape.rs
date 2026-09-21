@@ -11,11 +11,11 @@
 //! (Foundation); key handling (^Q f / +/- / [ ] / ^Q c / Enter / ^Q r) lives in
 //! `app::on_key_scrape`. This file stays thin and pure.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui::Frame;
 
 use super::titled_block;
 use crate::app::{App, ScrapeState};
@@ -157,11 +157,7 @@ fn explainer(s: &ScrapeState) -> Line<'static> {
 
 /// "ON" / "OFF" for a boolean flag.
 fn on_off(active: bool) -> &'static str {
-    if active {
-        "ON"
-    } else {
-        "OFF"
-    }
+    if active { "ON" } else { "OFF" }
 }
 
 /// Chip text for the full-rescrape toggle: "Full: ON" / "Full: OFF".

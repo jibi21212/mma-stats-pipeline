@@ -11,11 +11,11 @@
 //! from `sidecar.status()`). Key handling (^Q t/Enter train, ^Q l reload, ^Q r
 //! refresh) lives in `app::on_key_model`; this file is render-only.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
-use ratatui::Frame;
 
 use super::titled_block;
 use crate::app::App;

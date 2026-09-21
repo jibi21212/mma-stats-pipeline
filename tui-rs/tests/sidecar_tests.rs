@@ -24,12 +24,12 @@
 //!   panic / hang).
 
 // Mirror the crate's module tree so `crate::config` / `crate::models` / `crate::otel` resolve.
-#[path = "../src/otel.rs"]
-mod otel;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/models.rs"]
 mod models;
+#[path = "../src/otel.rs"]
+mod otel;
 #[path = "../src/sidecar.rs"]
 mod sidecar;
 

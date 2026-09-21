@@ -163,6 +163,29 @@ impl Db {
         Ok(out)
     }
 
+    /// Career columns for the radar overlay: name plus the six higher-is-better
+    /// axes (slpm, str_acc, str_def, td_avg, td_def, sub_avg). sapm is omitted.
+    pub fn load_radar_stats(&self) -> Result<Vec<(String, [Option<f64>; 6])>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, slpm, str_acc, str_def, td_avg, td_def, sub_avg \
+             FROM fighters ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                [
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ],
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Fighters whose name matches `query` (case-insensitive substring /
     /// SQL-side filter). Empty `query` returns all fighters. Ordered by name.
     ///

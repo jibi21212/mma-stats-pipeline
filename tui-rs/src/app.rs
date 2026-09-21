@@ -21,6 +21,7 @@ use crate::models::{
     DbSummary, Division, EligibilityRules, EventRow, FightRow, Fighter, LatestCard, PredictResult,
     RoundStat, SnapSelector, SnapshotMeta, WeightClass,
 };
+use crate::radar::RadarOverlay;
 use crate::scraper::ScrapeOptions;
 use crate::sidecar::Sidecar;
 use crate::{fuzzy, stats_text};
@@ -81,10 +82,12 @@ impl Screen {
             }
             Screen::Events => "↑↓ move · ⏎ open card · Esc Back · Home · ^Q q",
             Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · ^Q q",
-            Screen::FighterSearch => "type to search · ↑↓ move · ⏎ open · Esc Back · Home · ^Q q",
-            Screen::Fighter { .. } => "Esc Back · Home · ^Q q",
+            Screen::FighterSearch => {
+                "type to search · ↑↓ move · ⏎ open · ^Q r radar · Esc Back · Home · ^Q q"
+            }
+            Screen::Fighter { .. } => "^Q r radar · Esc Back · Home · ^Q q",
             Screen::Predict => {
-                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ class · ^Q p/s/u · ^⌫ clear · Esc Back · ^Q q"
+                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ class · ^Q p/s/u · ^Q r radar · ^⌫ clear · Esc Back · ^Q q"
             }
             Screen::Model => "⏎/^Q t train · ^Q l reload · ^Q r refresh · Esc Back · Home · ^Q q",
         }
@@ -421,6 +424,8 @@ pub struct App {
     /// Live scrape-telemetry status (`traces: Jaeger :16686 + file` or file-only).
     /// Refreshed when entering the Scrape screen and again at scrape spawn.
     pub scrape_traces_status: String,
+    /// Garnish radar overlay (Predict / Find-a-fighter / Fighter profile).
+    pub radar: Option<RadarOverlay>,
 }
 
 /// Which screen a key is being interpreted against (the prefix command map is
@@ -431,6 +436,7 @@ enum KeyScreen {
     Scrape,
     Model,
     FighterSearch,
+    Fighter,
     Other,
 }
 
@@ -441,6 +447,7 @@ impl KeyScreen {
             Screen::Scrape => Self::Scrape,
             Screen::Model => Self::Model,
             Screen::FighterSearch => Self::FighterSearch,
+            Screen::Fighter { .. } => Self::Fighter,
             _ => Self::Other,
         }
     }
@@ -452,6 +459,7 @@ impl KeyScreen {
 struct KeyCtx {
     prefix_armed: bool,
     picker_open: bool,
+    radar_open: bool,
     /// `None` = no job overlay; `Some(false)` = running; `Some(true)` = finished.
     job_finished: Option<bool>,
     screen: KeyScreen,
@@ -469,6 +477,8 @@ enum KeyIntent {
     Pop,
     DismissJob,
     CloseSnapshotPicker,
+    CloseRadar,
+    OpenRadar,
     ClearMatchup,
     PredictPrime,
     PredictToggleSnapshot,
@@ -537,6 +547,14 @@ fn interpret_key(key: &KeyEvent, ctx: &KeyCtx) -> KeyIntent {
         };
     }
 
+    if ctx.radar_open {
+        return match key.code {
+            KeyCode::Home => KeyIntent::GoHome,
+            KeyCode::Esc => KeyIntent::CloseRadar,
+            _ => KeyIntent::Noop,
+        };
+    }
+
     match key.code {
         KeyCode::Home => KeyIntent::GoHome,
         KeyCode::Esc => {
@@ -570,6 +588,9 @@ fn interpret_prefixed(key: &KeyEvent, ctx: &KeyCtx) -> KeyIntent {
                 ('p', KeyScreen::Predict) => KeyIntent::PredictPrime,
                 ('s', KeyScreen::Predict) => KeyIntent::PredictToggleSnapshot,
                 ('u', KeyScreen::Predict) => KeyIntent::PredictUpcomingCard,
+                ('r', KeyScreen::Predict | KeyScreen::FighterSearch | KeyScreen::Fighter) => {
+                    KeyIntent::OpenRadar
+                }
                 ('f', KeyScreen::Scrape) => KeyIntent::ScrapeToggleFull,
                 ('c', KeyScreen::Scrape) => KeyIntent::ScrapeClearLog,
                 ('r', KeyScreen::Scrape) => KeyIntent::ScrapeRun,
@@ -612,6 +633,7 @@ impl App {
             scrape: ScrapeState::default(),
             model: ModelState::default(),
             scrape_traces_status: String::new(),
+            radar: None,
         };
 
         app.refresh_db_summary();
@@ -631,6 +653,7 @@ impl App {
 
     /// Push `screen`, making it current, then load any data it needs.
     pub fn push(&mut self, screen: Screen) {
+        self.radar = None;
         self.nav.push(screen);
         self.on_enter_current();
     }
@@ -638,6 +661,7 @@ impl App {
     /// Pop one level (Esc / Backspace). No-op at the root (Home stays). Returns
     /// true if a pop actually happened.
     pub fn pop(&mut self) -> bool {
+        self.radar = None;
         if self.nav.len() > 1 {
             self.nav.pop();
             self.on_enter_current();
@@ -649,6 +673,7 @@ impl App {
 
     /// Clear the stack back to Home (the Home key).
     pub fn go_home(&mut self) {
+        self.radar = None;
         self.nav.truncate(1); // keep the root Home
         self.home_selected = 0;
         self.on_enter_current();
@@ -779,6 +804,7 @@ impl App {
         KeyCtx {
             prefix_armed: self.prefix_armed,
             picker_open: self.predict.picker_open,
+            radar_open: self.radar.is_some(),
             job_finished: self.job.as_ref().map(|j| j.status.is_finished()),
             screen: KeyScreen::of(self.current()),
         }
@@ -821,6 +847,14 @@ impl App {
             }
             KeyIntent::DismissJob => self.job = None,
             KeyIntent::CloseSnapshotPicker => self.predict.picker_open = false,
+            KeyIntent::CloseRadar => self.radar = None,
+            KeyIntent::OpenRadar => {
+                if self.radar.is_some() {
+                    self.radar = None;
+                } else {
+                    self.open_radar();
+                }
+            }
             KeyIntent::ClearMatchup => self.clear_matchup(),
             KeyIntent::PredictPrime => {
                 if self.predict.both_selected() {
@@ -864,6 +898,7 @@ impl App {
 
     /// Reset both Predict slots and return to an empty manual search.
     fn clear_matchup(&mut self) {
+        self.radar = None;
         self.predict.clear_matchup();
         self.refresh_predict_pool();
         self.recompute_predict_candidates();
@@ -1130,11 +1165,47 @@ impl App {
         }
     }
 
+    fn radar_subject_names(&self) -> Vec<String> {
+        match self.current() {
+            Screen::Predict => [self.predict.name_a.clone(), self.predict.name_b.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Screen::Fighter { name } => vec![name.clone()],
+            Screen::FighterSearch => self
+                .search
+                .selected_name()
+                .map(|n| vec![n.to_string()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn open_radar(&mut self) {
+        let names = self.radar_subject_names();
+        if names.is_empty() {
+            self.status_line = Some("Pick a fighter first.".to_string());
+            return;
+        }
+        match self.db.load_radar_stats() {
+            Ok(roster) => match crate::radar::build_overlay_from_stats(&names, &roster) {
+                Some(o) => self.radar = Some(o),
+                None => {
+                    self.status_line = Some("No radar stats for that fighter.".to_string());
+                }
+            },
+            Err(e) => self.status_line = Some(format!("Radar load failed: {e}")),
+        }
+    }
+
     // ======================================================================= //
     // PREDICT
     // ======================================================================= //
 
     fn on_key_predict(&mut self, key: KeyEvent) -> Result<()> {
+        if self.radar.is_some() {
+            return Ok(());
+        }
         // The snapshot picker overlay grabs all keys while open.
         if self.predict.picker_open {
             return self.on_key_snapshot_picker(key);
@@ -2420,6 +2491,7 @@ mod tests {
         KeyCtx {
             prefix_armed: false,
             picker_open: false,
+            radar_open: false,
             job_finished: None,
             screen: KeyScreen::Predict,
         }
@@ -2429,8 +2501,19 @@ mod tests {
         KeyCtx {
             prefix_armed: false,
             picker_open: false,
+            radar_open: false,
             job_finished: None,
             screen: KeyScreen::Other,
+        }
+    }
+
+    fn ctx_armed(screen: KeyScreen) -> KeyCtx {
+        KeyCtx {
+            prefix_armed: true,
+            picker_open: false,
+            radar_open: false,
+            job_finished: None,
+            screen,
         }
     }
 
@@ -2493,7 +2576,7 @@ mod tests {
     #[test]
     fn interpret_key_typing_q_s_p_on_predict_forwards() {
         let ctx = ctx_predict();
-        for c in ['q', 's', 'p'] {
+        for c in ['q', 's', 'p', 'r'] {
             assert_eq!(
                 interpret_key(&press(KeyCode::Char(c)), &ctx),
                 KeyIntent::Forward,
@@ -2552,6 +2635,55 @@ mod tests {
     }
 
     #[test]
+    fn interpret_key_esc_closes_radar_not_pop() {
+        let mut ctx = ctx_predict();
+        ctx.radar_open = true;
+        ctx.picker_open = true;
+        assert_eq!(
+            interpret_key(&press(KeyCode::Esc), &ctx),
+            KeyIntent::CloseRadar
+        );
+        let mut armed = ctx;
+        armed.prefix_armed = true;
+        assert_eq!(
+            interpret_key(&press(KeyCode::Esc), &armed),
+            KeyIntent::DisarmPrefix
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_q_r_opens_radar_on_fighter_screens() {
+        for screen in [
+            KeyScreen::Predict,
+            KeyScreen::FighterSearch,
+            KeyScreen::Fighter,
+        ] {
+            assert_eq!(
+                interpret_key(&press(KeyCode::Char('r')), &ctx_armed(screen)),
+                KeyIntent::OpenRadar,
+                "^Q r on {screen:?} must open radar"
+            );
+        }
+        assert_eq!(
+            interpret_key(&press(KeyCode::Char('r')), &ctx_predict()),
+            KeyIntent::Forward,
+            "bare r on Predict must type, not open radar"
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_q_r_stays_run_on_scrape_and_model() {
+        assert_eq!(
+            interpret_key(&press(KeyCode::Char('r')), &ctx_armed(KeyScreen::Scrape)),
+            KeyIntent::ScrapeRun
+        );
+        assert_eq!(
+            interpret_key(&press(KeyCode::Char('r')), &ctx_armed(KeyScreen::Model)),
+            KeyIntent::ModelRefresh
+        );
+    }
+
+    #[test]
     fn interpret_key_ctrl_backspace_and_ctrl_h_clear_matchup() {
         let ctx = ctx_predict();
         assert_eq!(
@@ -2599,9 +2731,19 @@ mod tests {
         assert!(!Screen::Home.footer_hint().contains("q Quit"));
         let predict = Screen::Predict.footer_hint();
         assert!(predict.contains("^Q p/s/u"));
+        assert!(predict.contains("^Q r radar"));
         assert!(predict.contains("^⌫ clear"));
         assert!(predict.contains("^Q q"));
+        assert!(Screen::FighterSearch.footer_hint().contains("^Q r radar"));
+        assert!(
+            Screen::Fighter { name: "x".into() }
+                .footer_hint()
+                .contains("^Q r radar")
+        );
         assert!(Screen::Scrape.footer_hint().contains("^Q f full"));
+        assert!(Screen::Scrape.footer_hint().contains("⏎/^Q r run"));
+        assert!(!Screen::Scrape.footer_hint().contains("radar"));
         assert!(Screen::Model.footer_hint().contains("^Q t train"));
+        assert!(Screen::Model.footer_hint().contains("^Q r refresh"));
     }
 }

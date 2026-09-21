@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use rusqlite::Connection;
 
 // =========================================================================== //
@@ -517,6 +517,24 @@ impl Session {
     /// assertions on the same frame without re-reading.
     fn wait_for(&self, needle: &str) -> String {
         self.wait_for_with_timeout(needle, POLL_TIMEOUT)
+    }
+
+    /// Block until the rendered screen does NOT contain `needle`.
+    fn wait_until_absent(&self, needle: &str) -> String {
+        let start = Instant::now();
+        loop {
+            let screen = self.screen();
+            if !screen.contains(needle) {
+                return screen;
+            }
+            if start.elapsed() >= POLL_TIMEOUT {
+                panic!(
+                    "timed out after {:?} waiting for {needle:?} to disappear.\n--- last screen ---\n{screen}\n--- end ---",
+                    POLL_TIMEOUT
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn wait_for_with_timeout(&self, needle: &str, timeout: Duration) -> String {
@@ -1099,6 +1117,91 @@ fn predict_s_types_into_search_not_snapshot() {
     assert!(
         searched.contains("✓ Israel Adesanya") && searched.contains("✓ Robert Whittaker"),
         "typing s should leave the committed picks in place:\n{searched}"
+    );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4r. PREDICT - ^Q r opens the radar overlay for both committed fighters;
+///     Esc closes it and the prediction result is still there.
+#[test]
+fn predict_radar_overlay_two_fighters() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Fighter A");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("✓ Israel Adesanya");
+    s.send(ENTER);
+    s.wait_for("✓ Robert Whittaker");
+    s.wait_for("62%");
+
+    send_prefix(&mut s, "r");
+    let radar = s.wait_for("Radar shape");
+    assert!(
+        radar.contains("Israel Adesanya") && radar.contains("Robert Whittaker"),
+        "radar title should name both fighters:\n{radar}"
+    );
+    for label in ["SLpM", "Acc", "Def", "TDd", "Sub"] {
+        assert!(
+            radar.contains(label),
+            "radar should show axis label {label}:\n{radar}"
+        );
+    }
+
+    s.send(ESC);
+    let back = s.wait_until_absent("Radar shape");
+    assert!(
+        back.contains("62%") && back.contains("Win probability"),
+        "Esc should return to the predict result:\n{back}"
+    );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4r2. FIND-A-FIGHTER - ^Q r opens radar for the highlighted fighter; Esc
+///      returns to the list. Opening the profile and ^Q r works there too.
+#[test]
+fn find_a_fighter_radar_overlay() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 1);
+    s.wait_for("Choose a path");
+    s.send(DOWN);
+    std::thread::sleep(Duration::from_millis(120));
+    s.send(ENTER);
+    s.wait_for("Search");
+    s.send("adesa");
+    s.wait_for("Fighters (1)");
+    s.wait_for("Israel Adesanya");
+
+    send_prefix(&mut s, "r");
+    let radar = s.wait_for("Radar shape");
+    assert!(
+        radar.contains("Israel Adesanya"),
+        "radar title should name the highlighted fighter:\n{radar}"
+    );
+    assert!(
+        radar.contains("SLpM") && radar.contains("TDd") && radar.contains("Sub"),
+        "radar should show axis labels:\n{radar}"
+    );
+
+    s.send(ESC);
+    s.wait_until_absent("Radar shape");
+    s.wait_for("Fighters (1)");
+
+    s.send(ENTER);
+    s.wait_for("Career stats");
+    send_prefix(&mut s, "r");
+    let profile_radar = s.wait_for("Radar shape");
+    assert!(
+        profile_radar.contains("SLpM") && profile_radar.contains("TDd"),
+        "profile radar should show axis labels:\n{profile_radar}"
     );
 
     send_quit(&mut s);

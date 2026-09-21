@@ -342,6 +342,23 @@ fn load_fighters_orders_by_name_and_maps_nulls() {
 }
 
 #[test]
+fn load_radar_stats_selects_six_axes_and_omits_sapm() {
+    let tmp = TempDb::new();
+    let db = tmp.open();
+    let rows = db.load_radar_stats().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|(_, axes)| axes.len() == 6));
+
+    let jones = rows.iter().find(|(n, _)| n == "Jon Jones").unwrap();
+    assert_eq!(jones.1[0], Some(4.29)); // slpm
+    assert_eq!(jones.1[1], Some(0.57)); // str_acc
+    assert_eq!(jones.1[5], Some(0.5)); // sub_avg
+
+    let silva = rows.iter().find(|(n, _)| n == "Anderson Silva").unwrap();
+    assert!(silva.1.iter().all(Option::is_none));
+}
+
+#[test]
 fn search_fighters_empty_returns_all() {
     let tmp = TempDb::new();
     let db = tmp.open();

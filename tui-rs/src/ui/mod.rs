@@ -26,6 +26,7 @@ pub mod home;
 pub mod loading;
 pub mod model;
 pub mod predict;
+pub mod radar;
 pub mod scrape;
 
 /// Top-level draw: render shared chrome and dispatch to the active screen (or
@@ -50,6 +51,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         loading::render(frame, body, app);
     } else {
         dispatch(frame, body, app);
+        if app.radar.is_some() {
+            radar::render(frame, body, app);
+        }
     }
 
     render_footer(frame, footer, app);

@@ -19,6 +19,7 @@ mod fuzzy;
 mod jobs;
 mod models;
 mod otel;
+mod radar;
 mod scraper;
 mod sidecar;
 mod stats_text;

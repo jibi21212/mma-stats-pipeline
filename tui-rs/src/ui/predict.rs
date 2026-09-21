@@ -17,11 +17,11 @@
 //! persistent footer (controls) is drawn by `ui::mod`, so we never draw our own.
 //! All state is read from `app.predict` (the migrated `PredictState`).
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
 use super::{focusable_block, titled_block};
 use crate::app::{App, PredictSlot, PredictView, UpcomingFightPrediction};
