@@ -8,7 +8,7 @@
 //! show up the moment the user dismisses the finished log and lands back here.
 //!
 //! Reads only `app.model` (`ModelState`, populated by `App::refresh_model_status`
-//! from `sidecar.status()`). Key handling (^Q t/Enter train, ^Q l reload, ^Q r
+//! from `sidecar.status()`). Key handling (^T/Enter train, ^L reload, ^R
 //! refresh) lives in `app::on_key_model`; this file is render-only.
 
 use ratatui::Frame;
@@ -84,12 +84,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(action(
-        "^Q t / ⏎",
-        "train the model (streams in the overlay)",
-    ));
-    lines.push(action("^Q l", "reload the on-disk model into the sidecar"));
-    lines.push(action("^Q r", "refresh status from the sidecar"));
+    lines.push(action("^T / ⏎", "train the model (streams in the overlay)"));
+    lines.push(action("^L", "reload the on-disk model into the sidecar"));
+    lines.push(action("^R", "refresh status from the sidecar"));
 
     let p = Paragraph::new(lines)
         .block(titled_block("Model status"))
@@ -112,7 +109,7 @@ fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
             )),
             Line::raw(""),
             Line::from(Span::styled(
-                "Press ^Q t (or Enter) to train the model. Metrics appear here once",
+                "Press ^T (or Enter) to train the model. Metrics appear here once",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(

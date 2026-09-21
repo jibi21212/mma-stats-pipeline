@@ -13,7 +13,7 @@
 //!     MENU: Scrape / Database / Predict / Model.
 //!   * NAVIGATION is a SCREEN STACK with NO hotkey jumps. On a menu, ↑/↓ move the
 //!     selection and ⏎ pushes the chosen screen; Esc AND Backspace pop one level;
-//!     the Home key clears back to the home menu; ^Q q quits. A persistent FOOTER
+//!     the Home key clears back to the home menu; Ctrl+C quits. A persistent FOOTER
 //!     shows the contextual controls (e.g. "↑↓ move · ⏎ select · …").
 //!   * DATABASE is a hub with two working paths: "Browse events" (events → a card
 //!     → a fighter) and "Find a fighter" (live fuzzy search → a fighter profile).
@@ -68,7 +68,13 @@ const HOME: &str = "\x1b[H";
 #[allow(dead_code)]
 const TAB: &str = "\t";
 const CTRL_C: &str = "\x03";
-const CTRL_Q: &str = "\x11";
+const CTRL_R: &str = "\x12";
+const CTRL_P: &str = "\x10";
+const CTRL_S: &str = "\x13";
+const CTRL_U: &str = "\x15";
+const CTRL_F: &str = "\x06";
+const CTRL_T: &str = "\x14";
+const CTRL_L: &str = "\x0c";
 const CTRL_BACKSPACE: &str = "\x08";
 const BACKSPACE: &str = "\x7f";
 
@@ -620,18 +626,12 @@ fn wait_home(s: &Session) -> String {
     s.wait_for("Predict");
     // The home footer is unique to the root menu (no "Esc Back" — you can't go
     // back from home), so it doubles as a "current screen == Home" assertion.
-    s.wait_for("↑↓ move · ⏎ select · ^Q q")
+    s.wait_for("↑↓ move · ⏎ select · ^C quit")
 }
 
-/// Ctrl+Q prefix then `letter` (tmux-style: press Ctrl+Q, then the command).
-fn send_prefix(s: &mut Session, letter: &str) {
-    s.send(CTRL_Q);
-    s.send(letter);
-}
-
-/// Quit via the Ctrl+Q prefix (`^Q q`).
+/// Quit via Ctrl+C only.
 fn send_quit(s: &mut Session) {
-    send_prefix(s, "q");
+    s.send(CTRL_C);
 }
 
 /// The nav breadcrumb (the header's body line, e.g. "Home › Database › Find a
@@ -697,8 +697,8 @@ fn results_list_region(screen: &str) -> String {
 ///    poster that headlines the latest NUMBERED UFC card from the seeded DB
 ///    ("UFC 287"), and the vertical 4-option menu (Scrape / Database / Predict /
 ///    Model) is visible. The selection HIGHLIGHT moves with ↑/↓: the highlight
-///    glyph "▶ " starts on Scrape and lands on Database after one Down. Then q
-///    quits cleanly.
+///    glyph "▶ " starts on Scrape and lands on Database after one Down. Then
+///    Ctrl+C quits cleanly.
 #[test]
 fn intro_and_home_menu() {
     let mut s = Session::spawn_stub();
@@ -752,9 +752,12 @@ fn intro_and_home_menu() {
     s.send(UP);
     s.wait_for("▶ Scrape");
 
-    // Quit on Home with 'q' -> clean exit.
+    // Quit on Home with Ctrl+C -> clean exit.
     send_quit(&mut s);
-    assert!(s.wait_clean_exit(), "process should exit successfully on q");
+    assert!(
+        s.wait_clean_exit(),
+        "process should exit successfully on Ctrl+C"
+    );
 }
 
 /// 2. NAVIGATION (screen stack, no hotkey jumps): ⏎ on a menu PUSHES into a
@@ -825,7 +828,7 @@ fn navigation_push_pop_home() {
     s.send(ENTER); // into Find a fighter (deep)
     s.wait_for("Home › Database › Find a fighter");
     s.send(HOME);
-    let home = s.wait_for("↑↓ move · ⏎ select · ^Q q");
+    let home = s.wait_for("↑↓ move · ⏎ select · ^C quit");
     assert_eq!(
         breadcrumb(&home),
         "Home",
@@ -833,7 +836,7 @@ fn navigation_push_pop_home() {
     );
 
     send_quit(&mut s);
-    assert!(s.wait_clean_exit(), "process should exit cleanly on q");
+    assert!(s.wait_clean_exit(), "process should exit cleanly on Ctrl+C");
 }
 
 /// 3a. DATABASE — "Find a fighter" path: Home -> Database -> Find a fighter ->
@@ -909,7 +912,7 @@ fn database_find_a_fighter_path() {
 }
 
 /// 3a2. DATABASE - typing `q` into Find a fighter searches (Joaquin Buckley)
-///      instead of quitting. Quit is `^Q q`.
+///      instead of quitting. Quit is Ctrl+C only.
 #[test]
 fn search_query_can_contain_q() {
     let mut s = Session::spawn_stub();
@@ -1123,7 +1126,7 @@ fn predict_s_types_into_search_not_snapshot() {
     assert!(s.wait_clean_exit());
 }
 
-/// 4r. PREDICT - ^Q r opens the radar overlay for both committed fighters;
+/// 4r. PREDICT - Ctrl+R opens the radar overlay for both committed fighters;
 ///     Esc closes it and the prediction result is still there.
 #[test]
 fn predict_radar_overlay_two_fighters() {
@@ -1139,7 +1142,7 @@ fn predict_radar_overlay_two_fighters() {
     s.wait_for("✓ Robert Whittaker");
     s.wait_for("62%");
 
-    send_prefix(&mut s, "r");
+    s.send(CTRL_R);
     let radar = s.wait_for("Radar shape");
     assert!(
         radar.contains("Israel Adesanya") && radar.contains("Robert Whittaker"),
@@ -1163,8 +1166,8 @@ fn predict_radar_overlay_two_fighters() {
     assert!(s.wait_clean_exit());
 }
 
-/// 4r2. FIND-A-FIGHTER - ^Q r opens radar for the highlighted fighter; Esc
-///      returns to the list. Opening the profile and ^Q r works there too.
+/// 4r2. FIND-A-FIGHTER - Ctrl+R opens radar for the highlighted fighter; Esc
+///      returns to the list. Opening the profile and Ctrl+R works there too.
 #[test]
 fn find_a_fighter_radar_overlay() {
     let mut s = Session::spawn_stub();
@@ -1180,7 +1183,7 @@ fn find_a_fighter_radar_overlay() {
     s.wait_for("Fighters (1)");
     s.wait_for("Israel Adesanya");
 
-    send_prefix(&mut s, "r");
+    s.send(CTRL_R);
     let radar = s.wait_for("Radar shape");
     assert!(
         radar.contains("Israel Adesanya"),
@@ -1197,7 +1200,7 @@ fn find_a_fighter_radar_overlay() {
 
     s.send(ENTER);
     s.wait_for("Career stats");
-    send_prefix(&mut s, "r");
+    s.send(CTRL_R);
     let profile_radar = s.wait_for("Radar shape");
     assert!(
         profile_radar.contains("SLpM") && profile_radar.contains("TDd"),
@@ -1209,7 +1212,7 @@ fn find_a_fighter_radar_overlay() {
 }
 
 /// 4a. PREDICT - UPCOMING CARD: with a future event present in the scraped DB,
-///     pressing ^Q u from the Predict screen predicts every fight on that next card.
+///     pressing Ctrl+U from the Predict screen predicts every fight on that next card.
 ///     This exercises the user path end-to-end: DB lookup -> per-fight sidecar
 ///     predictions -> card-level result pane.
 #[test]
@@ -1220,7 +1223,7 @@ fn predict_upcoming_card_from_scraped_future_event() {
     home_select_and_enter(&mut s, 2);
     s.wait_for("Fighter A");
 
-    send_prefix(&mut s, "u");
+    s.send(CTRL_U);
     let card = s.wait_for("Upcoming card predictions");
     assert!(
         card.contains("UFC Future Night"),
@@ -1378,7 +1381,7 @@ fn predict_weight_class_composes_with_eligibility() {
 
 /// 5. SCRAPE - chips + NO-FREEZE + spinner + streaming + completion.
 ///
-///    Home -> Scrape; assert the "Full: OFF" chip, press ^Q f and assert it flips to
+///    Home -> Scrape; assert the "Full: OFF" chip, press Ctrl+F and assert it flips to
 ///    "Full: ON" INSTANTLY; press Enter to run the (stub) scraper. WHILE it runs
 ///    we prove the UI is NOT frozen: the loading overlay's braille SPINNER glyph
 ///    advances between two timed captures AND the streamed log/progress arrives
@@ -1401,15 +1404,15 @@ fn scrape_chips_no_freeze_and_streams() {
         "the Full chip should start OFF:\n{opts}"
     );
 
-    // '^Q f' flips the chip to ON instantly (chip is re-rendered the next frame).
-    send_prefix(&mut s, "f");
+    // Ctrl+F flips the chip to ON instantly (chip is re-rendered the next frame).
+    s.send(CTRL_F);
     let on = s.wait_for("Full: ON");
     assert!(
         on.contains("Full: ON"),
-        "pressing ^Q f should flip the chip to Full: ON:\n{on}"
+        "pressing Ctrl+F should flip the chip to Full: ON:\n{on}"
     );
     // Flip it back OFF so the next run is the cheap incremental scrape.
-    send_prefix(&mut s, "f");
+    s.send(CTRL_F);
     s.wait_for("Full: OFF");
 
     // RUN: Enter launches the async job + the loading overlay.
@@ -1420,7 +1423,7 @@ fn scrape_chips_no_freeze_and_streams() {
     // the body was replaced by the loading overlay).
     let running = s.wait_for("running");
     assert!(
-        running.contains("running… · ^Q q"),
+        running.contains("running… · ^C quit"),
         "the footer should show the running-job hint while the scrape runs:\n{running}"
     );
 
@@ -1736,7 +1739,7 @@ fn real_stack_smoke() {
     // quits — exercising the screen-stack nav against the real stack too.
     s.send(ESC);
     s.send(HOME);
-    s.wait_for("↑↓ move · ⏎ select · ^Q q");
+    s.wait_for("↑↓ move · ⏎ select · ^C quit");
     s.send(CTRL_C);
     assert!(
         s.wait_clean_exit(),
@@ -1756,7 +1759,13 @@ fn _key_table_is_referenced() {
         ESC,
         ENTER,
         CTRL_C,
-        CTRL_Q,
+        CTRL_R,
+        CTRL_P,
+        CTRL_S,
+        CTRL_U,
+        CTRL_F,
+        CTRL_T,
+        CTRL_L,
         CTRL_BACKSPACE,
         BACKSPACE,
         HOME,

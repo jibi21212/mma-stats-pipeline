@@ -22,9 +22,10 @@ builds are fast.)
   for the roster, model status, and fight predictions over JSON lines. All ML
   math lives in Python; the TUI never reimplements it.
 - **Predicts** either a manually selected matchup or the next scraped upcoming
-  card from the Predict screen (`^Q u`), showing per-fight odds and row-level errors.
-  Letter commands use a Ctrl+Q prefix (press Ctrl+Q, then the letter) so typing a
-  name cannot fire a shortcut; on Predict, Ctrl+Backspace clears both fighter slots.
+  card from the Predict screen (`^U`), showing per-fight odds and row-level errors.
+  Letter commands are held Ctrl+letter chords so typing a name cannot fire a
+  shortcut. Quit is Ctrl+C only. On Predict, Ctrl+R opens radar; Ctrl+Backspace
+  clears both fighter slots.
 - **Runs** the Go scraper on demand and streams its progress into a log pane.
   Traces: `make telemetry-up`, then `make` (or `./mma`), scrape inside the TUI,
   open http://localhost:16686 (service `mma-scraper`). No extra env vars.

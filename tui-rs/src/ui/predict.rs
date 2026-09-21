@@ -399,7 +399,7 @@ fn render_upcoming_card(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let Some(event) = &app.predict.card_event else {
-        let p = Paragraph::new("Press ^Q u to predict the next scraped upcoming card.")
+        let p = Paragraph::new("Press ^U to predict the next scraped upcoming card.")
             .block(titled_block("Upcoming card predictions"))
             .wrap(Wrap { trim: true });
         frame.render_widget(p, area);
@@ -577,7 +577,7 @@ fn render_snapshot_picker(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let title =
-        format!("Snapshot — {slot_name}   (↑↓ pick · ←→ switch fighter · ⏎ use · esc/^Q s close)");
+        format!("Snapshot — {slot_name}   (↑↓ pick · ←→ switch fighter · ⏎ use · esc/^S close)");
     let list = List::new(items)
         .block(titled_block(&title).border_style(Style::default().fg(accent)))
         .highlight_style(

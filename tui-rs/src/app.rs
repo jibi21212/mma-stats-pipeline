@@ -75,21 +75,21 @@ impl Screen {
     /// Contextual footer hint string for this screen (without job overlay).
     pub fn footer_hint(&self) -> &'static str {
         match self {
-            Screen::Home => "↑↓ move · ⏎ select · ^Q q",
-            Screen::Database => "↑↓ move · ⏎ select · Esc Back · Home · ^Q q",
+            Screen::Home => "↑↓ move · ⏎ select · ^C quit",
+            Screen::Database => "↑↓ move · ⏎ select · Esc Back · Home · ^C quit",
             Screen::Scrape => {
-                "^Q f full · +/- limit · [/] rate · ^Q c clear · ⏎/^Q r run · Esc Back · Home · ^Q q"
+                "^F full · +/- limit · [/] rate · ^L clear · ⏎/^R run · Esc Back · Home · ^C quit"
             }
-            Screen::Events => "↑↓ move · ⏎ open card · Esc Back · Home · ^Q q",
-            Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · ^Q q",
+            Screen::Events => "↑↓ move · ⏎ open card · Esc Back · Home · ^C quit",
+            Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · ^C quit",
             Screen::FighterSearch => {
-                "type to search · ↑↓ move · ⏎ open · ^Q r radar · Esc Back · Home · ^Q q"
+                "type to search · ↑↓ move · ⏎ open · ^R radar · Esc Back · Home · ^C quit"
             }
-            Screen::Fighter { .. } => "^Q r radar · Esc Back · Home · ^Q q",
+            Screen::Fighter { .. } => "^R radar · Esc Back · Home · ^C quit",
             Screen::Predict => {
-                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ class · ^Q p/s/u · ^Q r radar · ^⌫ clear · Esc Back · ^Q q"
+                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ class · ^P/^S/^U · ^R radar · ^⌫ clear · Esc Back · ^C quit"
             }
-            Screen::Model => "⏎/^Q t train · ^Q l reload · ^Q r refresh · Esc Back · Home · ^Q q",
+            Screen::Model => "⏎/^T train · ^L reload · ^R refresh · Esc Back · Home · ^C quit",
         }
     }
 }
@@ -378,9 +378,6 @@ pub struct App {
     pub sidecar: Sidecar,
     /// Set to true to exit the event loop.
     pub should_quit: bool,
-    /// Ctrl+Q prefix is armed: the next letter is a command, not search text.
-    /// Footer shows `^Q-` while this is true. A second Ctrl+Q or Esc cancels.
-    pub prefix_armed: bool,
     /// Transient status line shown at the bottom of the UI.
     pub status_line: Option<String>,
 
@@ -428,7 +425,7 @@ pub struct App {
     pub radar: Option<RadarOverlay>,
 }
 
-/// Which screen a key is being interpreted against (the prefix command map is
+/// Which screen a key is being interpreted against (Ctrl+letter commands are
 /// per-screen; Other covers Home / Database / Events / profiles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyScreen {
@@ -453,11 +450,10 @@ impl KeyScreen {
     }
 }
 
-/// Snapshot of the bits `interpret_key` needs. Pure so prefix behaviour can be
+/// Snapshot of the bits `interpret_key` needs. Pure so chord behaviour can be
 /// unit-tested without constructing a full `App`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyCtx {
-    prefix_armed: bool,
     picker_open: bool,
     radar_open: bool,
     /// `None` = no job overlay; `Some(false)` = running; `Some(true)` = finished.
@@ -465,14 +461,12 @@ struct KeyCtx {
     screen: KeyScreen,
 }
 
-/// Outcome of one key after prefix / global binding rules, before per-screen
-/// typing and arrows.
+/// Outcome of one key after global / Ctrl+letter binding rules, before
+/// per-screen typing and arrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyIntent {
     Noop,
     Quit,
-    ArmPrefix,
-    DisarmPrefix,
     GoHome,
     Pop,
     DismissJob,
@@ -512,30 +506,30 @@ fn typing_char(key: KeyEvent) -> Option<char> {
     }
 }
 
-/// Pure key interpretation: Ctrl+C quits, Ctrl+Q is a prefix, letter commands
-/// fire only after that prefix, and printable letters otherwise Forward into
-/// the focused search field.
+fn ctrl_letter(key: &KeyEvent) -> Option<char> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Pure key interpretation: Ctrl+C quits, letter commands are held Ctrl+letter
+/// chords so typing never fires them, and printable letters otherwise Forward
+/// into the focused search field. Ctrl+Q is never quit.
 fn interpret_key(key: &KeyEvent, ctx: &KeyCtx) -> KeyIntent {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
-    {
+    if ctrl_letter(key) == Some('c') {
         return KeyIntent::Quit;
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q' | 'Q'))
-    {
-        return if ctx.prefix_armed {
-            KeyIntent::DisarmPrefix
-        } else {
-            KeyIntent::ArmPrefix
-        };
-    }
-
-    if ctx.prefix_armed {
-        return interpret_prefixed(key, ctx);
     }
 
     if ctx.job_finished.is_none() && ctx.screen == KeyScreen::Predict && is_ctrl_backspace(key) {
         return KeyIntent::ClearMatchup;
+    }
+
+    if let Some(c) = ctrl_letter(key) {
+        return interpret_ctrl_letter(c, ctx);
     }
 
     if ctx.job_finished.is_some() {
@@ -573,33 +567,23 @@ fn interpret_key(key: &KeyEvent, ctx: &KeyCtx) -> KeyIntent {
     }
 }
 
-fn interpret_prefixed(key: &KeyEvent, ctx: &KeyCtx) -> KeyIntent {
-    match key.code {
-        KeyCode::Esc => KeyIntent::DisarmPrefix,
-        KeyCode::Char(c) => {
-            let c = c.to_ascii_lowercase();
-            if c == 'q' {
-                return KeyIntent::Quit;
-            }
-            if ctx.job_finished.is_some() {
-                return KeyIntent::Noop;
-            }
-            match (c, ctx.screen) {
-                ('p', KeyScreen::Predict) => KeyIntent::PredictPrime,
-                ('s', KeyScreen::Predict) => KeyIntent::PredictToggleSnapshot,
-                ('u', KeyScreen::Predict) => KeyIntent::PredictUpcomingCard,
-                ('r', KeyScreen::Predict | KeyScreen::FighterSearch | KeyScreen::Fighter) => {
-                    KeyIntent::OpenRadar
-                }
-                ('f', KeyScreen::Scrape) => KeyIntent::ScrapeToggleFull,
-                ('c', KeyScreen::Scrape) => KeyIntent::ScrapeClearLog,
-                ('r', KeyScreen::Scrape) => KeyIntent::ScrapeRun,
-                ('r', KeyScreen::Model) => KeyIntent::ModelRefresh,
-                ('t', KeyScreen::Model) => KeyIntent::ModelTrain,
-                ('l', KeyScreen::Model) => KeyIntent::ModelReload,
-                _ => KeyIntent::Noop,
-            }
+fn interpret_ctrl_letter(c: char, ctx: &KeyCtx) -> KeyIntent {
+    if ctx.job_finished.is_some() {
+        return KeyIntent::Noop;
+    }
+    match (c, ctx.screen) {
+        ('p', KeyScreen::Predict) => KeyIntent::PredictPrime,
+        ('s', KeyScreen::Predict) => KeyIntent::PredictToggleSnapshot,
+        ('u', KeyScreen::Predict) => KeyIntent::PredictUpcomingCard,
+        ('r', KeyScreen::Predict | KeyScreen::FighterSearch | KeyScreen::Fighter) => {
+            KeyIntent::OpenRadar
         }
+        ('f', KeyScreen::Scrape) => KeyIntent::ScrapeToggleFull,
+        ('l', KeyScreen::Scrape) => KeyIntent::ScrapeClearLog,
+        ('r', KeyScreen::Scrape) => KeyIntent::ScrapeRun,
+        ('r', KeyScreen::Model) => KeyIntent::ModelRefresh,
+        ('t', KeyScreen::Model) => KeyIntent::ModelTrain,
+        ('l', KeyScreen::Model) => KeyIntent::ModelReload,
         _ => KeyIntent::Noop,
     }
 }
@@ -613,7 +597,6 @@ impl App {
             db,
             sidecar,
             should_quit: false,
-            prefix_armed: false,
             status_line: None,
             nav: vec![Screen::Home],
             frame: 0,
@@ -802,7 +785,6 @@ impl App {
 
     fn key_ctx(&self) -> KeyCtx {
         KeyCtx {
-            prefix_armed: self.prefix_armed,
             picker_open: self.predict.picker_open,
             radar_open: self.radar.is_some(),
             job_finished: self.job.as_ref().map(|j| j.status.is_finished()),
@@ -811,30 +793,18 @@ impl App {
     }
 
     /// Handle one key event, mutating state and possibly triggering side
-    /// effects. Letter commands require a Ctrl+Q prefix so search fields can
+    /// effects. Letter commands are held Ctrl+letter chords so search fields
     /// accept `q` / `s` / `p` / etc. as typed text.
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
-
-        let intent = interpret_key(&key, &self.key_ctx());
-        match intent {
-            KeyIntent::ArmPrefix => {
-                self.prefix_armed = true;
-                Ok(())
-            }
-            other => {
-                self.prefix_armed = false;
-                self.apply_key_intent(key, other)
-            }
-        }
+        self.apply_key_intent(key, interpret_key(&key, &self.key_ctx()))
     }
 
     fn apply_key_intent(&mut self, key: KeyEvent, intent: KeyIntent) -> Result<()> {
         match intent {
-            KeyIntent::ArmPrefix => self.prefix_armed = true,
-            KeyIntent::DisarmPrefix | KeyIntent::Noop => {}
+            KeyIntent::Noop => {}
             KeyIntent::Quit => self.should_quit = true,
             KeyIntent::GoHome => {
                 if self.job.as_ref().is_some_and(|j| j.status.is_finished()) {
@@ -1264,7 +1234,7 @@ impl App {
     /// Keys while the snapshot-picker overlay is open. Rows are
     /// `[Current, Prime, <fight 0>, <fight 1>, ...]`; Up/Down navigate, Left/Right
     /// switch which fighter is being picked, Enter commits the snapshot + re-runs.
-    /// Esc and `^Q s` close the picker (handled in `interpret_key`).
+    /// Esc and Ctrl+S close the picker (handled in `interpret_key`).
     fn on_key_snapshot_picker(&mut self, key: KeyEvent) -> Result<()> {
         let total = 2 + self.predict.picker_snaps.len(); // Current + Prime + fights
         match key.code {
@@ -2476,7 +2446,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------- //
-    // PREFIX KEYS + CLEAR MATCHUP
+    // CTRL+LETTER CHORDS + CLEAR MATCHUP
     // ----------------------------------------------------------------------- //
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -2487,34 +2457,21 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
-    fn ctx_predict() -> KeyCtx {
+    fn ctx_screen(screen: KeyScreen) -> KeyCtx {
         KeyCtx {
-            prefix_armed: false,
-            picker_open: false,
-            radar_open: false,
-            job_finished: None,
-            screen: KeyScreen::Predict,
-        }
-    }
-
-    fn ctx_home() -> KeyCtx {
-        KeyCtx {
-            prefix_armed: false,
-            picker_open: false,
-            radar_open: false,
-            job_finished: None,
-            screen: KeyScreen::Other,
-        }
-    }
-
-    fn ctx_armed(screen: KeyScreen) -> KeyCtx {
-        KeyCtx {
-            prefix_armed: true,
             picker_open: false,
             radar_open: false,
             job_finished: None,
             screen,
         }
+    }
+
+    fn ctx_predict() -> KeyCtx {
+        ctx_screen(KeyScreen::Predict)
+    }
+
+    fn ctx_home() -> KeyCtx {
+        ctx_screen(KeyScreen::Other)
     }
 
     #[test]
@@ -2576,7 +2533,7 @@ mod tests {
     #[test]
     fn interpret_key_typing_q_s_p_on_predict_forwards() {
         let ctx = ctx_predict();
-        for c in ['q', 's', 'p', 'r'] {
+        for c in ['q', 's', 'p', 'r', 'u'] {
             assert_eq!(
                 interpret_key(&press(KeyCode::Char(c)), &ctx),
                 KeyIntent::Forward,
@@ -2591,36 +2548,29 @@ mod tests {
     }
 
     #[test]
-    fn interpret_key_ctrl_q_then_q_quits() {
+    fn interpret_key_ctrl_c_quits_and_ctrl_q_never_does() {
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('c')), &ctx_home()),
+            KeyIntent::Quit
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('C')), &ctx_predict()),
+            KeyIntent::Quit
+        );
         assert_eq!(
             interpret_key(&ctrl(KeyCode::Char('q')), &ctx_home()),
-            KeyIntent::ArmPrefix
-        );
-        let mut armed = ctx_home();
-        armed.prefix_armed = true;
-        assert_eq!(
-            interpret_key(&press(KeyCode::Char('q')), &armed),
-            KeyIntent::Quit
+            KeyIntent::Noop,
+            "Ctrl+Q must never quit"
         );
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('Q')), &armed),
-            KeyIntent::Quit
+            interpret_key(&ctrl(KeyCode::Char('Q')), &ctx_predict()),
+            KeyIntent::Noop,
+            "Ctrl+Q must never quit"
         );
-    }
-
-    #[test]
-    fn interpret_key_ctrl_q_then_esc_disarms_without_pop() {
-        let mut armed = ctx_home();
-        armed.prefix_armed = true;
         assert_eq!(
-            interpret_key(&press(KeyCode::Esc), &armed),
-            KeyIntent::DisarmPrefix
-        );
-        assert_ne!(interpret_key(&press(KeyCode::Esc), &armed), KeyIntent::Pop);
-        // A second Ctrl+Q also disarms.
-        assert_eq!(
-            interpret_key(&ctrl(KeyCode::Char('q')), &armed),
-            KeyIntent::DisarmPrefix
+            interpret_key(&press(KeyCode::Char('q')), &ctx_home()),
+            KeyIntent::Forward,
+            "bare q must not quit"
         );
     }
 
@@ -2643,25 +2593,29 @@ mod tests {
             interpret_key(&press(KeyCode::Esc), &ctx),
             KeyIntent::CloseRadar
         );
-        let mut armed = ctx;
-        armed.prefix_armed = true;
         assert_eq!(
-            interpret_key(&press(KeyCode::Esc), &armed),
-            KeyIntent::DisarmPrefix
+            interpret_key(&ctrl(KeyCode::Char('r')), &ctx),
+            KeyIntent::OpenRadar,
+            "Ctrl+R should still toggle radar while the overlay is open"
         );
     }
 
     #[test]
-    fn interpret_key_ctrl_q_r_opens_radar_on_fighter_screens() {
+    fn interpret_key_ctrl_r_opens_radar_on_fighter_screens() {
         for screen in [
             KeyScreen::Predict,
             KeyScreen::FighterSearch,
             KeyScreen::Fighter,
         ] {
             assert_eq!(
-                interpret_key(&press(KeyCode::Char('r')), &ctx_armed(screen)),
+                interpret_key(&ctrl(KeyCode::Char('r')), &ctx_screen(screen)),
                 KeyIntent::OpenRadar,
-                "^Q r on {screen:?} must open radar"
+                "Ctrl+R on {screen:?} must open radar"
+            );
+            assert_eq!(
+                interpret_key(&ctrl(KeyCode::Char('R')), &ctx_screen(screen)),
+                KeyIntent::OpenRadar,
+                "Ctrl+R (uppercase) on {screen:?} must open radar"
             );
         }
         assert_eq!(
@@ -2672,13 +2626,13 @@ mod tests {
     }
 
     #[test]
-    fn interpret_key_ctrl_q_r_stays_run_on_scrape_and_model() {
+    fn interpret_key_ctrl_r_stays_run_on_scrape_and_refresh_on_model() {
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('r')), &ctx_armed(KeyScreen::Scrape)),
+            interpret_key(&ctrl(KeyCode::Char('r')), &ctx_screen(KeyScreen::Scrape)),
             KeyIntent::ScrapeRun
         );
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('r')), &ctx_armed(KeyScreen::Model)),
+            interpret_key(&ctrl(KeyCode::Char('r')), &ctx_screen(KeyScreen::Model)),
             KeyIntent::ModelRefresh
         );
     }
@@ -2702,48 +2656,89 @@ mod tests {
     }
 
     #[test]
-    fn interpret_key_unknown_prefixed_letter_is_noop() {
-        let mut armed = ctx_predict();
-        armed.prefix_armed = true;
+    fn interpret_key_ctrl_letter_commands_and_unknown_is_noop() {
+        let ctx = ctx_predict();
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('x')), &armed),
-            KeyIntent::Noop
+            interpret_key(&ctrl(KeyCode::Char('p')), &ctx),
+            KeyIntent::PredictPrime
         );
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('s')), &armed),
+            interpret_key(&ctrl(KeyCode::Char('s')), &ctx),
             KeyIntent::PredictToggleSnapshot
         );
-        let mut scrape = armed;
-        scrape.screen = KeyScreen::Scrape;
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('f')), &scrape),
+            interpret_key(&ctrl(KeyCode::Char('u')), &ctx),
+            KeyIntent::PredictUpcomingCard
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('x')), &ctx),
+            KeyIntent::Noop
+        );
+
+        let scrape = ctx_screen(KeyScreen::Scrape);
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('f')), &scrape),
             KeyIntent::ScrapeToggleFull
         );
         assert_eq!(
-            interpret_key(&press(KeyCode::Char('s')), &scrape),
+            interpret_key(&ctrl(KeyCode::Char('l')), &scrape),
+            KeyIntent::ScrapeClearLog
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('s')), &scrape),
             KeyIntent::Noop
+        );
+
+        let model = ctx_screen(KeyScreen::Model);
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('t')), &model),
+            KeyIntent::ModelTrain
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('l')), &model),
+            KeyIntent::ModelReload
         );
     }
 
     #[test]
-    fn footer_hints_use_ctrl_q_prefix() {
-        assert!(Screen::Home.footer_hint().contains("^Q q"));
+    fn interpret_key_ctrl_s_toggles_snapshot_picker() {
+        let mut ctx = ctx_predict();
+        ctx.picker_open = true;
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('s')), &ctx),
+            KeyIntent::PredictToggleSnapshot
+        );
+        assert_eq!(
+            interpret_key(&press(KeyCode::Esc), &ctx),
+            KeyIntent::CloseSnapshotPicker
+        );
+    }
+
+    #[test]
+    fn footer_hints_use_ctrl_letter_chords() {
+        assert!(Screen::Home.footer_hint().contains("^C quit"));
+        assert!(!Screen::Home.footer_hint().contains("^Q"));
         assert!(!Screen::Home.footer_hint().contains("q Quit"));
         let predict = Screen::Predict.footer_hint();
-        assert!(predict.contains("^Q p/s/u"));
-        assert!(predict.contains("^Q r radar"));
+        assert!(predict.contains("^P/^S/^U"));
+        assert!(predict.contains("^R radar"));
         assert!(predict.contains("^⌫ clear"));
-        assert!(predict.contains("^Q q"));
-        assert!(Screen::FighterSearch.footer_hint().contains("^Q r radar"));
+        assert!(predict.contains("^C quit"));
+        assert!(!predict.contains("^Q"));
+        assert!(Screen::FighterSearch.footer_hint().contains("^R radar"));
         assert!(
             Screen::Fighter { name: "x".into() }
                 .footer_hint()
-                .contains("^Q r radar")
+                .contains("^R radar")
         );
-        assert!(Screen::Scrape.footer_hint().contains("^Q f full"));
-        assert!(Screen::Scrape.footer_hint().contains("⏎/^Q r run"));
+        assert!(Screen::Scrape.footer_hint().contains("^F full"));
+        assert!(Screen::Scrape.footer_hint().contains("⏎/^R run"));
+        assert!(Screen::Scrape.footer_hint().contains("^L clear"));
         assert!(!Screen::Scrape.footer_hint().contains("radar"));
-        assert!(Screen::Model.footer_hint().contains("^Q t train"));
-        assert!(Screen::Model.footer_hint().contains("^Q r refresh"));
+        assert!(!Screen::Scrape.footer_hint().contains("^Q"));
+        assert!(Screen::Model.footer_hint().contains("^T train"));
+        assert!(Screen::Model.footer_hint().contains("^L reload"));
+        assert!(Screen::Model.footer_hint().contains("^R refresh"));
+        assert!(!Screen::Model.footer_hint().contains("^Q"));
     }
 }
