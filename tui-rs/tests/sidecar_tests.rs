@@ -23,6 +23,10 @@
 //! - a sidecar that exits without answering is handled gracefully (an `Err`, no
 //!   panic / hang).
 
+// The `#[path]`-included modules are whole `src/` files; each test crate only
+// exercises a slice of them, so the rest is legitimately unused here.
+#![allow(dead_code)]
+
 // Mirror the crate's module tree so `crate::config` / `crate::models` / `crate::otel` resolve.
 #[path = "../src/config.rs"]
 mod config;
@@ -543,6 +547,12 @@ fn fixture_stub_predict_matches_rust_model_exactly() {
         (sum_b - 0.38).abs() < 1e-9,
         "B method probs sum to P(B win)"
     );
+    // Both fighters carry their own "if they win" split, each summing to 1.
+    for (side, given) in [("A", mp.a_given_win), ("B", mp.b_given_win)] {
+        let g = given.unwrap_or_else(|| panic!("{side} given-win split present"));
+        let sum = g.decision.unwrap() + g.ko_tko.unwrap() + g.submission.unwrap();
+        assert!((sum - 1.0).abs() < 1e-9, "{side} given-win split sums to 1");
+    }
 }
 
 #[test]

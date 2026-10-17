@@ -333,6 +333,7 @@ impl Db {
     /// Deterministic variant of [`Self::next_upcoming_event`] for tests and
     /// callers that already have an ISO `YYYY-MM-DD` cutoff.
     #[cfg(test)]
+    #[allow(dead_code)] // exercised by tests/db_tests.rs, not by the bin's own unit tests
     pub fn next_upcoming_event_on_or_after(&self, today_iso: &str) -> Result<Option<EventRow>> {
         let sql = format!(
             "SELECT {EVENT_COLS} FROM events \
@@ -385,11 +386,19 @@ impl Db {
 /// Parse the card number out of a numbered UFC title like `"UFC 311"` ->
 /// `Some(311)`. Returns `None` for non-numbered titles (`"UFC Fight Night"`,
 /// `"UFC on ESPN 42"` etc.) — only a title whose first whitespace-separated
-/// token after `"UFC"` is purely digits counts. Pure helper, unit-tested below.
+/// token after `"UFC"` is digits, optionally followed by punctuation (the real
+/// `"UFC 331: Van vs. Pantoja 2"` shape), counts. Pure helper, unit-tested below.
 pub fn parse_card_number(title: &str) -> Option<u32> {
     let rest = title.strip_prefix("UFC ")?;
     let token = rest.split_whitespace().next()?;
-    token.parse::<u32>().ok()
+    let digits_end = token
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(token.len());
+    let (digits, tail) = token.split_at(digits_end);
+    if tail.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    digits.parse::<u32>().ok()
 }
 
 #[cfg(test)]
@@ -401,6 +410,9 @@ mod tests {
         assert_eq!(parse_card_number("UFC 311"), Some(311));
         assert_eq!(parse_card_number("UFC 1"), Some(1));
         assert_eq!(parse_card_number("UFC 300"), Some(300));
+        // Real scraped titles carry the billing after a colon.
+        assert_eq!(parse_card_number("UFC 331: Van vs. Pantoja 2"), Some(331));
+        assert_eq!(parse_card_number("UFC 300: Pereira vs. Hill"), Some(300));
     }
 
     #[test]
@@ -410,5 +422,7 @@ mod tests {
         assert_eq!(parse_card_number("UFC Fight Night: Smith vs Jones"), None);
         assert_eq!(parse_card_number("PFL 5"), None);
         assert_eq!(parse_card_number("UFC"), None);
+        assert_eq!(parse_card_number("UFC 2B"), None);
+        assert_eq!(parse_card_number("UFC :"), None);
     }
 }

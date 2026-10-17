@@ -23,6 +23,9 @@ builds are fast.)
   math lives in Python; the TUI never reimplements it.
 - **Predicts** either a manually selected matchup or the next scraped upcoming
   card from the Predict screen (`^U`), showing per-fight odds and row-level errors.
+  A manual matchup shows each fighter's win probability plus an "If X wins" card
+  for **both** fighters: how they win (decision / KO-TKO / submission) as a share
+  of their own wins, with their most likely path highlighted.
   Letter commands are held Ctrl+letter chords so typing a name cannot fire a
   shortcut. Quit is Ctrl+C only. On Predict, Ctrl+R opens radar; Ctrl+Backspace
   clears both fighter slots.

@@ -25,11 +25,11 @@
 //! env overrides resolved in `src/config.rs`, so there is NO network, NO real
 //! model and NO real DB writes:
 //!   * `MMA_DB`      -> a tiny temp SQLite DB seeded here (4 contract tables +
-//!                      the same known fighters as the stub roster).
+//!     the same known fighters as the stub roster).
 //!   * `MMA_SIDECAR` -> `tests/fixtures/stub_sidecar.py` (canned IPC responses).
 //!   * `MMA_SCRAPER` -> `tests/fixtures/stub_scraper.sh` (canned progress lines,
-//!                      with a small sleep between each so streaming + the
-//!                      non-blocking loop are OBSERVABLE mid-run).
+//!     with a small sleep between each so streaming + the non-blocking loop are
+//!     OBSERVABLE mid-run).
 //!
 //! Timing: the TUI redraws on a 100ms tick and external processes (sidecar,
 //! scraper) run asynchronously, so EVERY assertion is preceded by a poll that
@@ -434,17 +434,29 @@ impl Session {
         Session::spawn_with(db, env)
     }
 
+    /// Spawn the stub stack in a smaller `rows` x `cols` terminal.
+    fn spawn_stub_sized(rows: u16, cols: u16) -> Session {
+        let db = TempDb::new();
+        let env = stub_env(&db);
+        Session::spawn_sized(db, env, rows, cols)
+    }
+
     /// Spawn the binary in a PTY with `env` applied on top of a clean base.
     ///
     /// `TERM=xterm-256color` and a fixed 45x140 size are always set so rendering
     /// is deterministic regardless of the (TTY-less) test runner environment.
     fn spawn_with(db: TempDb, env: Vec<(String, String)>) -> Session {
+        Session::spawn_sized(db, env, ROWS, COLS)
+    }
+
+    /// [`Session::spawn_with`] at an explicit `rows` x `cols` geometry.
+    fn spawn_sized(db: TempDb, env: Vec<(String, String)>, rows: u16, cols: u16) -> Session {
         let bin = mma_tui_bin();
 
         let pty = native_pty_system()
             .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -466,7 +478,7 @@ impl Session {
         let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
         let writer = pty.master.take_writer().expect("take pty writer");
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let eof = Arc::new(Mutex::new(false));
 
         // Reader thread: pump child output into the vt100 parser until EOF.
@@ -657,7 +669,7 @@ fn breadcrumb(screen: &str) -> String {
     // Root: find the framed line that strips to exactly "Home".
     screen
         .lines()
-        .map(|l| strip(l))
+        .map(strip)
         .find(|s| s == "Home")
         .unwrap_or_default()
 }
@@ -1009,6 +1021,7 @@ fn database_browse_events_path() {
 ///        is FILTERED OUT, proving the filter is real (not "all-but-A"). So the
 ///        single candidate at index 0 is "Robert Whittaker"; Enter commits B.
 ///      - With both slots committed, the sidecar prediction fires automatically.
+///
 ///    The stub returns prob_a 0.62 / prob_b 0.38 and a full tale-of-the-tape.
 #[test]
 fn predict_shows_probability_and_tale() {
@@ -1045,6 +1058,25 @@ fn predict_shows_probability_and_tale() {
         screen.contains("Win probability"),
         "the Win probability pane should render:\n{screen}"
     );
+
+    // BOTH fighters get an "If X wins" card with their win % and their own
+    // method split (stub: A 30/28/4 of 62% -> 48/45/6%, B 20/15/3 of 38% ->
+    // 53/39/8%), each with a best-path callout carrying its overall share.
+    let cards = s.wait_for("If Robert Whittaker wins · 38%");
+    for want in [
+        "If Israel Adesanya wins · 62%",
+        "48%",
+        "45%",
+        "53%",
+        "39%",
+        "Best path: decision · 30% overall",
+        "Best path: decision · 20% overall",
+    ] {
+        assert!(
+            cards.contains(want),
+            "missing {want:?} in method cards:\n{cards}"
+        );
+    }
 
     // Tale-of-the-tape rows for both fighters (labels + a deterministic value).
     let tale = s.wait_for("Tale of the tape");
@@ -1090,6 +1122,36 @@ fn predict_shows_probability_and_tale() {
         !cleared.contains("62%"),
         "Ctrl+Backspace should clear the prediction result:\n{cleared}"
     );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4b. PREDICT on a short 80x30 terminal: the win split and BOTH fighters'
+///     method cards still render (the cards outrank the info box for space).
+#[test]
+fn predict_short_terminal_keeps_both_method_cards() {
+    let mut s = Session::spawn_stub_sized(30, 80);
+    wait_home(&s);
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Alex Pereira");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("✓ Israel Adesanya");
+    s.send(ENTER);
+
+    let screen = s.wait_for("If Robert Whittaker wins · 38%");
+    for want in [
+        "If Israel Adesanya wins · 62%",
+        "62% | 38%",
+        "Best path: decision · 30% overall",
+        "Best path: decision · 20% overall",
+    ] {
+        assert!(
+            screen.contains(want),
+            "missing {want:?} at 80x30:\n{screen}"
+        );
+    }
 
     send_quit(&mut s);
     assert!(s.wait_clean_exit());

@@ -244,6 +244,13 @@ pub struct MethodProbs {
 pub struct MethodSplit {
     pub a: MethodProbs,
     pub b: MethodProbs,
+    /// `P(method | A wins)`: A's own "if they win" split (sums to 1). `None` from
+    /// an older sidecar that predates it.
+    #[serde(default)]
+    pub a_given_win: Option<MethodProbs>,
+    /// `P(method | B wins)`: B's own "if they win" split (sums to 1).
+    #[serde(default)]
+    pub b_given_win: Option<MethodProbs>,
     /// The empirical-Bayes shrinkage strength used (shown in the UI).
     #[serde(default)]
     pub kappa: Option<f64>,
@@ -753,6 +760,26 @@ mod tests {
         assert_eq!(mp.a.decision, Some(0.3));
         assert_eq!(mp.b.ko_tko, Some(0.17));
         assert_eq!(mp.kappa, Some(6.0));
+        // A sidecar that predates the per-fighter conditional still deserializes.
+        assert!(mp.a_given_win.is_none());
+        assert!(mp.b_given_win.is_none());
+    }
+
+    #[test]
+    fn method_split_deserializes_each_fighters_given_win_split() {
+        let mp: MethodSplit = serde_json::from_str(
+            r#"{"a":{"decision":0.3,"ko_tko":0.25,"submission":0.05},
+                "b":{"decision":0.2,"ko_tko":0.1,"submission":0.1},
+                "a_given_win":{"decision":0.5,"ko_tko":0.4166,"submission":0.0834},
+                "b_given_win":{"decision":0.5,"ko_tko":0.25,"submission":null},
+                "kappa":6.0}"#,
+        )
+        .unwrap();
+        let a = mp.a_given_win.expect("a_given_win");
+        let b = mp.b_given_win.expect("b_given_win");
+        assert_eq!(a.decision, Some(0.5));
+        assert_eq!(b.ko_tko, Some(0.25));
+        assert_eq!(b.submission, None, "JSON null -> None");
     }
 
     #[test]

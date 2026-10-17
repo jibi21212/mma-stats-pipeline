@@ -957,7 +957,11 @@ def method_split(snap_a, snap_b, prob_a, prob_b, base_rate, kappa=METHOD_PRIOR_K
     Composes ``P(win) x P(method | win)`` for each fighter, where the conditional
     blends THAT fighter's offensive method mix with the OPPONENT's defensive mix.
     The six returned probabilities sum to ``prob_a + prob_b == 1``.
-    Returns ``{"a": {decision, ko_tko, submission}, "b": {...}, "kappa": float}``.
+    ``a_given_win`` / ``b_given_win`` are the per-fighter conditionals
+    ``P(method | that fighter wins)`` (each sums to 1), so a UI can show how the
+    underdog wins on the same footing as the favourite.
+    Returns ``{"a": {decision, ko_tko, submission}, "b": {...},
+    "a_given_win": {...}, "b_given_win": {...}, "kappa": float}``.
     """
     off_a = [snap_a.get("w_decision", 0), snap_a.get("w_ko_tko", 0), snap_a.get("w_submission", 0)]
     def_a = [snap_a.get("l_decision", 0), snap_a.get("l_ko_tko", 0), snap_a.get("l_submission", 0)]
@@ -968,6 +972,8 @@ def method_split(snap_a, snap_b, prob_a, prob_b, base_rate, kappa=METHOD_PRIOR_K
     return {
         "a": {c: float(prob_a * q_a[c]) for c in METHOD_CLASSES},
         "b": {c: float(prob_b * q_b[c]) for c in METHOD_CLASSES},
+        "a_given_win": {c: float(q_a[c]) for c in METHOD_CLASSES},
+        "b_given_win": {c: float(q_b[c]) for c in METHOD_CLASSES},
         "kappa": float(kappa),
     }
 

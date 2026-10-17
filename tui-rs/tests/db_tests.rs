@@ -12,6 +12,10 @@
 //! `use crate::models::...`, so we also pull in `src/models.rs` as the test
 //! crate's `models` module so that path resolves identically.
 
+// The `#[path]`-included modules are whole `src/` files; each test crate only
+// exercises a slice of them, so the rest is legitimately unused here.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 

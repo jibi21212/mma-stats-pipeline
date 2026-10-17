@@ -567,6 +567,24 @@ def test_method_probs_symmetry(trained_model):
     for cls in P.METHOD_CLASSES:
         assert r_ab["method_probs"]["a"][cls] == pytest.approx(
             r_ba["method_probs"]["b"][cls], abs=1e-9)
+        assert r_ab["method_probs"]["a_given_win"][cls] == pytest.approx(
+            r_ba["method_probs"]["b_given_win"][cls], abs=1e-9)
+
+
+def test_method_probs_given_win_is_each_fighters_own_split(trained_model):
+    # Both fighters (favourite AND underdog) get a conditional "if they win"
+    # split that sums to 1 and is consistent with the joint: joint = P(win) x share.
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    res = P.predict(a, b, path=trained_model)
+    mp = res["method_probs"]
+    for side, prob in (("a", res["prob_a"]), ("b", res["prob_b"])):
+        given = mp[f"{side}_given_win"]
+        assert set(given) == set(P.METHOD_CLASSES)
+        assert sum(given.values()) == pytest.approx(1.0, abs=1e-9)
+        for cls in P.METHOD_CLASSES:
+            assert 0.0 <= given[cls] <= 1.0
+            assert mp[side][cls] == pytest.approx(prob * given[cls], abs=1e-9)
 
 
 def test_conditional_method_dist_debut_is_base_rate():

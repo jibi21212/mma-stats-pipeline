@@ -66,8 +66,10 @@ Payloads:
                   The result carries ``prob_a``/``prob_b``, the per-fighter tale of
                   the tape, ``snap_a_label``/``snap_b_label`` (which snapshot each
                   side used), and ``method_probs`` (a coherent JOINT win-method
-                  distribution {"a":{decision,ko_tko,submission},"b":{...}} or null
-                  on a legacy payload). (ok:false if no model / unknown fighter.)
+                  distribution {"a":{decision,ko_tko,submission},"b":{...}} plus
+                  each fighter's conditional split "a_given_win"/"b_given_win"
+                  (P(method | that fighter wins), each summing to 1), or null on a
+                  legacy payload). (ok:false if no model / unknown fighter.)
     timeline   -> {"ok":true,"name":str,"snapshots":[{index,fight_id,date,opponent,
                   result,weight_class,record,elo,win_streak,is_prime}, ...]}
                   The selectable career snapshots for a fighter, oldest first, with

@@ -178,6 +178,11 @@ def _predict_result(name_a, name_b, snap_a=None, snap_b=None):
         "method_probs": {
             "a": {"decision": 0.30, "ko_tko": 0.28, "submission": 0.04},
             "b": {"decision": 0.20, "ko_tko": 0.15, "submission": 0.03},
+            # Each fighter's own "if they win" split (joint / P(win), sums to 1).
+            "a_given_win": {"decision": 0.30 / 0.62, "ko_tko": 0.28 / 0.62,
+                            "submission": 0.04 / 0.62},
+            "b_given_win": {"decision": 0.20 / 0.38, "ko_tko": 0.15 / 0.38,
+                            "submission": 0.03 / 0.38},
             "kappa": 6.0,
         },
     }

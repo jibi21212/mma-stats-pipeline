@@ -146,17 +146,20 @@ fn headline_lines(card: Option<&LatestCard>) -> Vec<Line<'static>> {
             // the event title itself.
             let headline = poster_headline(card);
             lines.push(Line::from(Span::styled(
-                headline,
+                headline.clone(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )));
             // The full event title (shown even when the number headlines above,
-            // since a numbered title can carry extra fight billing).
-            lines.push(Line::from(Span::styled(
-                card.title.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )));
+            // since a numbered title can carry extra fight billing), unless the
+            // headline already IS the title (unnumbered card).
+            if headline != card.title {
+                lines.push(Line::from(Span::styled(
+                    card.title.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
             if let Some(sub) = subtitle(card) {
                 lines.push(Line::from(Span::styled(
                     sub,
@@ -265,6 +268,38 @@ mod tests {
             ..card
         };
         assert_eq!(subtitle(&card2), None);
+    }
+
+    #[test]
+    fn headline_lines_never_repeat_the_title() {
+        let text = |card: &LatestCard| -> Vec<String> {
+            headline_lines(Some(card))
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let unnumbered = LatestCard {
+            event_id: 2,
+            title: "UFC Fight Night: Smith vs Jones".into(),
+            date: Some("2025-01-18".into()),
+            location: None,
+            number: None,
+        };
+        let lines = text(&unnumbered);
+        assert_eq!(
+            lines.iter().filter(|l| **l == unnumbered.title).count(),
+            1,
+            "{lines:?}"
+        );
+        // A numbered card shouts the number AND keeps the billing line.
+        let numbered = LatestCard {
+            title: "UFC 331: Van vs. Pantoja 2".into(),
+            number: Some(331),
+            ..unnumbered
+        };
+        let lines = text(&numbered);
+        assert!(lines.contains(&"UFC 331".to_string()), "{lines:?}");
+        assert!(lines.contains(&numbered.title), "{lines:?}");
     }
 
     #[test]

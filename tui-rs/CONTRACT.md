@@ -62,8 +62,10 @@ error: {"id":N,"ok":false,"error":"<message>"}
 tale_a, tale_b, model, test_accuracy`, plus `snap_a_label`/`snap_b_label` (which
 snapshot each side used, e.g. `"current"` / `"prime (2021-03-06)"`) and
 `method_probs` — a coherent **joint** win-method distribution
-`{"a":{decision,ko_tko,submission},"b":{...},"kappa":f}` (or `null` on a legacy
-payload), where all six values sum to 1. Each `tale_*` has:
+`{"a":{decision,ko_tko,submission},"b":{...},"a_given_win":{...},"b_given_win":{...},"kappa":f}`
+(or `null` on a legacy payload), where the six `a`/`b` values sum to 1 and
+`a_given_win`/`b_given_win` are each fighter's conditional split
+`P(method | that fighter wins)` (each sums to 1; absent on an older sidecar). Each `tale_*` has:
 `elo, age, record (str "W-L"), reach_in, height_in, stance, recent_winrate,
 form_delta, layoff_days, divisions (list)`.
 
@@ -116,7 +118,9 @@ dates/DOB ISO `YYYY-MM-DD` text; missing numerics are NULL → `Option::None`.
   and `method_probs: Option<MethodSplit>`.
 - `struct MethodProbs` — `decision, ko_tko, submission: Option<f64>`.
 - `struct MethodSplit` — `a: MethodProbs, b: MethodProbs, kappa: Option<f64>` (the
-  six `a`/`b` values are a coherent joint distribution summing to 1).
+  six `a`/`b` values are a coherent joint distribution summing to 1), plus
+  `#[serde(default)] a_given_win, b_given_win: Option<MethodProbs>` (each fighter's
+  conditional "if they win" split, summing to 1; `None` from an older sidecar).
 - `enum SnapSelector` (`#[serde(untagged)]`) — `Anchor(String)` (`"current"`/
   `"latest"`/`"prime"`), `Fight { fight_id: i64 }`, or `Date { date: String }`.
 - `struct SnapshotMeta` — `index: i64, fight_id: Option<i64>, date: String,
