@@ -321,19 +321,13 @@ impl Db {
     /// SQLite's local current date. Used by the Predict screen's whole-card
     /// action. Returns `None` when the scraped DB has no future-dated events.
     pub fn next_upcoming_event(&self) -> Result<Option<EventRow>> {
-        let sql = format!(
-            "SELECT {EVENT_COLS} FROM events \
-             WHERE date IS NOT NULL AND date <> '' AND date >= date('now','localtime') \
-             ORDER BY date ASC, event_id DESC LIMIT 1"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        Ok(stmt.query_row([], map_event).optional()?)
+        let today: String = self
+            .conn
+            .query_row("SELECT date('now','localtime')", [], |r| r.get(0))?;
+        self.next_upcoming_event_on_or_after(&today)
     }
 
-    /// Deterministic variant of [`Self::next_upcoming_event`] for tests and
-    /// callers that already have an ISO `YYYY-MM-DD` cutoff.
-    #[cfg(test)]
-    #[allow(dead_code)] // exercised by tests/db_tests.rs, not by the bin's own unit tests
+    /// Earliest non-empty event date on or after the ISO `YYYY-MM-DD` cutoff.
     pub fn next_upcoming_event_on_or_after(&self, today_iso: &str) -> Result<Option<EventRow>> {
         let sql = format!(
             "SELECT {EVENT_COLS} FROM events \
