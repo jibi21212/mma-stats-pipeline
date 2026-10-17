@@ -8,7 +8,7 @@
 //! body for the loading overlay (`ui::loading`) - spinner, elapsed time, progress
 //! bar, and the live process log - so the live run UI is handled there, not here.
 //! The toggle state lives on `App.scrape`
-//! (Foundation); key handling (^F / +/- / [ ] / ^L / Enter / ^R) lives in
+//! (Foundation); key handling (^F / +/- / [ ] / Enter / ^R) lives in
 //! `app::on_key_scrape`. This file stays thin and pure.
 
 use ratatui::Frame;
@@ -51,7 +51,6 @@ fn body_lines(s: &ScrapeState, traces: &str) -> Vec<Line<'static>> {
             "[ / ]",
             &format!("slow / speed up rate by 0.5 (now {})", rate_text(s.rate)),
         ),
-        legend("^L", "clear the log from the last finished run"),
         Line::raw(""),
         section("Run"),
         run_call_to_action(),

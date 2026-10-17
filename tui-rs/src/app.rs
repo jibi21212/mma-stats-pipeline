@@ -78,7 +78,7 @@ impl Screen {
             Screen::Home => "↑↓ move · ⏎ select · ^C quit",
             Screen::Database => "↑↓ move · ⏎ select · Esc Back · Home · ^C quit",
             Screen::Scrape => {
-                "^F full · +/- limit · [/] rate · ^L clear · ⏎/^R run · Esc Back · Home · ^C quit"
+                "^F full · +/- limit · [/] rate · ⏎/^R run · Esc Back · Home · ^C quit"
             }
             Screen::Events => "↑↓ move · ⏎ open card · Esc Back · Home · ^C quit",
             Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · ^C quit",
@@ -478,7 +478,6 @@ enum KeyIntent {
     PredictToggleSnapshot,
     PredictUpcomingCard,
     ScrapeToggleFull,
-    ScrapeClearLog,
     ScrapeRun,
     ModelRefresh,
     ModelTrain,
@@ -579,7 +578,6 @@ fn interpret_ctrl_letter(c: char, ctx: &KeyCtx) -> KeyIntent {
             KeyIntent::OpenRadar
         }
         ('f', KeyScreen::Scrape) => KeyIntent::ScrapeToggleFull,
-        ('l', KeyScreen::Scrape) => KeyIntent::ScrapeClearLog,
         ('r', KeyScreen::Scrape) => KeyIntent::ScrapeRun,
         ('r', KeyScreen::Model) => KeyIntent::ModelRefresh,
         ('t', KeyScreen::Model) => KeyIntent::ModelTrain,
@@ -840,7 +838,6 @@ impl App {
             }
             KeyIntent::PredictUpcomingCard => self.predict_latest_upcoming_card(),
             KeyIntent::ScrapeToggleFull => self.scrape.full = !self.scrape.full,
-            KeyIntent::ScrapeClearLog => {}
             KeyIntent::ScrapeRun => self.start_scrape(),
             KeyIntent::ModelRefresh => {
                 self.refresh_model_status();
@@ -2680,10 +2677,6 @@ mod tests {
             KeyIntent::ScrapeToggleFull
         );
         assert_eq!(
-            interpret_key(&ctrl(KeyCode::Char('l')), &scrape),
-            KeyIntent::ScrapeClearLog
-        );
-        assert_eq!(
             interpret_key(&ctrl(KeyCode::Char('s')), &scrape),
             KeyIntent::Noop
         );
@@ -2732,7 +2725,6 @@ mod tests {
         );
         assert!(Screen::Scrape.footer_hint().contains("^F full"));
         assert!(Screen::Scrape.footer_hint().contains("⏎/^R run"));
-        assert!(Screen::Scrape.footer_hint().contains("^L clear"));
         assert!(!Screen::Scrape.footer_hint().contains("radar"));
         assert!(!Screen::Scrape.footer_hint().contains("^Q"));
         assert!(Screen::Model.footer_hint().contains("^T train"));
