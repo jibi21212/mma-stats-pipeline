@@ -58,7 +58,7 @@ rely on is documented in [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
 |---|---|---|
 | `scraper-go/` | Go 1.26+ (no CGO) | goquery, `golang.org/x/time`, `modernc.org/sqlite` |
 | `ml/` | Python 3.10+ (3.11 tested) | pandas, numpy, scikit-learn, matplotlib, seaborn, mlxtend (umap optional), joblib |
-| `tui-rs/` | Rust (stable) | ratatui, rusqlite, ratatui-image |
+| `tui-rs/` | Rust (stable) | ratatui, crossterm, rusqlite, fuzzy-matcher, serde |
 | storage | SQLite (WAL) | shared `data/ufc.db` (gitignored, built locally) |
 
 The trained predictor lives at `ml/models/predictor.joblib` (gitignored);
