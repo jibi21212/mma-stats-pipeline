@@ -1606,9 +1606,8 @@ impl App {
     // ======================================================================= //
 
     fn on_key_model(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Enter => self.start_train(),
-            _ => {}
+        if key.code == KeyCode::Enter {
+            self.start_train();
         }
         Ok(())
     }

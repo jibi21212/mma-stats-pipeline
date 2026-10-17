@@ -140,6 +140,7 @@ fn build_overlay(names: &[String], roster: &[Fighter]) -> Option<RadarOverlay> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)] // one named arg per radar stat reads best in fixtures
     fn fighter(
         name: &str,
         slpm: Option<f64>,

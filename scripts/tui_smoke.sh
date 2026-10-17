@@ -41,7 +41,8 @@
 #   On failure: prints "FAIL: ..." plus the captured screen, exits non-zero.
 #
 # REQUIREMENTS
-#   tmux, /opt/homebrew/bin/cargo, and (preferably) the sqlite3 CLI on PATH.
+#   tmux, cargo (e.g. via `nix develop`; override with $CARGO), and
+#   (preferably) the sqlite3 CLI on PATH.
 #
 # STEPS / ASSERTIONS
 #   (1) Intro + Home menu  -> assert the "mma-tui" brand, the poster ("UFC 281",
@@ -54,13 +55,14 @@
 #   (3) Predict full run   -> Home, Down x2, Enter into Predict; commit Alex
 #                             Pereira (Enter) then Israel Adesanya (Down, Enter);
 #                             assert the OUTPUT: win % (62%/38%), the Win
-#                             probability pane, and a tale row with record "24-3".
+#                             probability pane, both "If X wins" method cards,
+#                             and a tale row with record "24-3".
 #   (4) Scrape no-freeze   -> Home, Enter into Scrape; assert "Full: OFF"; press
-#                             f -> "Full: ON"; Enter to run; assert the running
+#                             Ctrl+F -> "Full: ON"; Enter to run; assert the running
 #                             overlay streams "saved event 1/3" AND the braille
 #                             SPINNER glyph CHANGES across samples (loop not frozen)
 #                             AND a completion line "Scraping finished OK".
-#   (5) Quit               -> Home, q, assert the tmux session is gone.
+#   (5) Quit               -> Home, Ctrl+C, assert the tmux session is gone.
 # =============================================================================
 
 set -euo pipefail
@@ -68,9 +70,9 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 # Constants / paths.
 # --------------------------------------------------------------------------- #
-REPO="/Users/jibi/Documents/Personal_Projects/mma-stats-pipeline"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TUI_DIR="$REPO/tui-rs"
-CARGO="/opt/homebrew/bin/cargo"
+CARGO="${CARGO:-cargo}"
 BIN="$TUI_DIR/target/debug/mma-tui"
 FIX="$TUI_DIR/tests/fixtures"
 STUB_SIDECAR="$FIX/stub_sidecar.py"
@@ -163,7 +165,7 @@ wait_for() {
 # 0. Preconditions.
 # --------------------------------------------------------------------------- #
 command -v tmux >/dev/null 2>&1 || { echo "FAIL: tmux not found on PATH"; exit 1; }
-[ -x "$CARGO" ] || { echo "FAIL: cargo not found at $CARGO"; exit 1; }
+command -v "$CARGO" >/dev/null 2>&1 || { echo "FAIL: cargo not found ($CARGO)"; exit 1; }
 [ -f "$STUB_SIDECAR" ] || { echo "FAIL: stub sidecar missing: $STUB_SIDECAR"; exit 1; }
 [ -x "$STUB_SCRAPER" ] || { echo "FAIL: stub scraper missing/not executable: $STUB_SCRAPER"; exit 1; }
 
@@ -324,7 +326,7 @@ for opt in Scrape Database Predict Model; do
     assert_contains "$opt"
 done
 # The home footer is unique to the root menu (no Esc Back).
-assert_contains "⏎ select · q Quit"
+assert_contains "⏎ select · ^C quit"
 # Highlight starts on Scrape, then moves to Database with Down.
 wait_for "▶ Scrape"
 assert_contains "▶ Scrape"
@@ -407,7 +409,7 @@ assert_contains "Record:"
 echo "[smoke] step 3: predict runs and renders a probability + tale"
 tmux send-keys -t "$SES" Home    # clear the stack back to the home menu
 sleep 0.4
-wait_for "⏎ select · q Quit"
+wait_for "⏎ select · ^C quit"
 send Down            # Scrape -> Database
 send Down            # Database -> Predict
 send Enter           # push Predict
@@ -441,6 +443,11 @@ assert_contains "Tale of the tape"
 assert_contains "Elo rating"
 # Deterministic stub tale value: tale_a record "24-3".
 assert_contains "24-3"
+# BOTH fighters get an "If X wins" method card with their own best path.
+assert_contains "If Israel Adesanya wins · 62%"
+assert_contains "If Robert Whittaker wins · 38%"
+assert_contains "Best path: decision · 30% overall"
+assert_contains "Best path: decision · 20% overall"
 # LOCAL-FILTER PROOF (the negative): no refusal vocabulary may appear — an
 # ineligible matchup can never reach the predict call, so the defensive "Matchup
 # not allowed" branch (and any cross-gender / not-allowed reason) never renders.
@@ -452,7 +459,7 @@ assert_not_contains "cross-"
 # --------------------------------------------------------------------------- #
 # STEP 4: Scrape — chips + NO-FREEZE streaming + completion.
 #
-# Home, Enter into Scrape; assert the "Full: OFF" chip and that f flips it ON;
+# Home, Enter into Scrape; assert the "Full: OFF" chip and that Ctrl+F flips it ON;
 # Enter runs the (stub) scraper. WHILE it runs we prove the loop is NOT frozen:
 # a mid-run progress line streams in AND the braille SPINNER glyph CHANGES across
 # repeated samples. Finally the app's own completion marker appears.
@@ -460,14 +467,14 @@ assert_not_contains "cross-"
 echo "[smoke] step 4: scrape streams without freezing"
 tmux send-keys -t "$SES" Home
 sleep 0.4
-wait_for "⏎ select · q Quit"
+wait_for "⏎ select · ^C quit"
 send Enter           # Scrape is the first option (already highlighted)
 wait_for "Scraper options"
 assert_contains "Full: OFF"
-send "f"
+send C-f
 wait_for "Full: ON"
 assert_contains "Full: ON"
-send "f"             # flip back OFF (cheap incremental run)
+send C-f             # flip back OFF (cheap incremental run)
 wait_for "Full: OFF"
 send Enter           # RUN the async job + loading overlay
 
@@ -515,13 +522,13 @@ send Enter
 wait_for "Scraper options"
 
 # --------------------------------------------------------------------------- #
-# STEP 5: Quit — Home, then q; the tmux session/pane must disappear.
+# STEP 5: Quit — Home, then Ctrl+C; the tmux session/pane must disappear.
 # --------------------------------------------------------------------------- #
 echo "[smoke] step 5: quit ends the session"
 tmux send-keys -t "$SES" Home
 sleep 0.4
-wait_for "⏎ select · q Quit"
-tmux send-keys -t "$SES" "q"
+wait_for "⏎ select · ^C quit"
+tmux send-keys -t "$SES" C-c
 
 # Poll for the session to vanish (the binary exits, tmux reaps the pane).
 gone=0
