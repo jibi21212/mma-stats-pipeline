@@ -19,6 +19,7 @@ mod fuzzy;
 mod jobs;
 mod models;
 mod otel;
+mod radar;
 mod scraper;
 mod sidecar;
 mod stats_text;
@@ -75,6 +76,7 @@ fn main() -> Result<()> {
 ///     smooth ~30 fps. ratatui's per-cell diff makes each redraw flicker-free.
 ///   * when the screen is static we poll on the slow [`TICK_IDLE`] cadence so the
 ///     CPU idles instead of busy-redrawing a still frame.
+///
 /// In both cases a keypress short-circuits the wait, and we always `on_tick`
 /// (drain the job channel) so streaming + completion are handled promptly.
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {

@@ -18,13 +18,14 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::jobs::{self, JobKind, JobStatus, RunningJob};
 use crate::models::{
-    Division, DbSummary, EligibilityRules, EventRow, FightRow, Fighter, LatestCard, PredictResult,
-    RoundStat, WeightClass,
+    DbSummary, Division, EligibilityRules, EventRow, FightRow, Fighter, LatestCard, PredictResult,
+    RoundStat, SnapSelector, SnapshotMeta, WeightClass,
 };
-use std::collections::HashMap;
+use crate::radar::RadarOverlay;
 use crate::scraper::ScrapeOptions;
 use crate::sidecar::Sidecar;
 use crate::{fuzzy, stats_text};
+use std::collections::HashMap;
 
 // =========================================================================== //
 // SCREEN STACK
@@ -74,19 +75,21 @@ impl Screen {
     /// Contextual footer hint string for this screen (without job overlay).
     pub fn footer_hint(&self) -> &'static str {
         match self {
-            Screen::Home => "↑↓ move · ⏎ select · q Quit",
-            Screen::Database => "↑↓ move · ⏎ select · Esc Back · Home · q Quit",
+            Screen::Home => "↑↓ move · ⏎ select · ^C quit",
+            Screen::Database => "↑↓ move · ⏎ select · Esc Back · Home · ^C quit",
             Screen::Scrape => {
-                "f full · +/- limit · [/] rate · c clear · ⏎/r run · Esc Back · Home · q Quit"
+                "^F full · +/- limit · [/] rate · ⏎/^R run · Esc Back · Home · ^C quit"
             }
-            Screen::Events => "↑↓ move · ⏎ open card · Esc Back · Home · q Quit",
-            Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · q Quit",
-            Screen::FighterSearch => "type to search · ↑↓ move · ⏎ open · Esc Back · Home · q Quit",
-            Screen::Fighter { .. } => "Esc Back · Home · q Quit",
+            Screen::Events => "↑↓ move · ⏎ open card · Esc Back · Home · ^C quit",
+            Screen::EventFights { .. } => "↑↓ move · ⏎ fighter · Esc Back · Home · ^C quit",
+            Screen::FighterSearch => {
+                "type to search · ↑↓ move · ⏎ open · ^R radar · Esc Back · Home · ^C quit"
+            }
+            Screen::Fighter { .. } => "^R radar · Esc Back · Home · ^C quit",
             Screen::Predict => {
-                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ weight class · Esc Back · Home · q Quit"
+                "type · ↑↓ pick · ⏎ choose · ←→ slot · ⇥ class · ^P/^S/^U · ^R radar · ^⌫ clear · Esc Back · ^C quit"
             }
-            Screen::Model => "t train · l reload · r refresh · Esc Back · Home · q Quit",
+            Screen::Model => "⏎/^T train · ^L reload · ^R refresh · Esc Back · Home · ^C quit",
         }
     }
 }
@@ -144,9 +147,29 @@ pub enum PredictSlot {
     B,
 }
 
+/// Which result surface the Predict screen is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PredictView {
+    #[default]
+    Manual,
+    UpcomingCard,
+}
+
+/// One row in a whole-card prediction run.
+#[derive(Debug, Clone)]
+pub struct UpcomingFightPrediction {
+    pub fight: FightRow,
+    pub fighter_a: Option<String>,
+    pub fighter_b: Option<String>,
+    pub result: Option<PredictResult>,
+    pub error: Option<String>,
+}
+
 /// State for the Predict screen.
 #[derive(Debug, Clone, Default)]
 pub struct PredictState {
+    /// Which output surface is active.
+    pub view: PredictView,
     /// Slot currently being edited / picked.
     pub slot: PredictSlot,
     /// Selected weight-class filter, as an index into the fetched
@@ -176,6 +199,25 @@ pub struct PredictState {
     pub result: Option<PredictResult>,
     /// Last error message (e.g. model not trained / unknown fighter).
     pub error: Option<String>,
+    /// Snapshot selector for fighter A (`None` = current / latest version).
+    pub snap_a: Option<SnapSelector>,
+    /// Snapshot selector for fighter B (`None` = current / latest version).
+    pub snap_b: Option<SnapSelector>,
+    /// Whether the snapshot picker overlay is open (drill into a career timeline).
+    pub picker_open: bool,
+    /// Which slot the picker is choosing a snapshot for.
+    pub picker_slot: PredictSlot,
+    /// The picker's fighter timeline (the two anchors Current/Prime are prepended
+    /// by the renderer; these are the per-fight rows).
+    pub picker_snaps: Vec<SnapshotMeta>,
+    /// Highlighted picker row: 0 = Current, 1 = Prime, 2.. = `picker_snaps[i-2]`.
+    pub picker_selected: usize,
+    /// Event selected by the whole-card predictor.
+    pub card_event: Option<EventRow>,
+    /// Per-fight prediction rows for `card_event`.
+    pub card_predictions: Vec<UpcomingFightPrediction>,
+    /// Whole-card loading/query error, such as no upcoming event in the DB.
+    pub card_error: Option<String>,
 }
 
 /// State for the Events screen (browse path).
@@ -379,6 +421,169 @@ pub struct App {
     /// Live scrape-telemetry status (`traces: Jaeger :16686 + file` or file-only).
     /// Refreshed when entering the Scrape screen and again at scrape spawn.
     pub scrape_traces_status: String,
+    /// Garnish radar overlay (Predict / Find-a-fighter / Fighter profile).
+    pub radar: Option<RadarOverlay>,
+}
+
+/// Which screen a key is being interpreted against (Ctrl+letter commands are
+/// per-screen; Other covers Home / Database / Events / profiles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyScreen {
+    Predict,
+    Scrape,
+    Model,
+    FighterSearch,
+    Fighter,
+    Other,
+}
+
+impl KeyScreen {
+    fn of(screen: &Screen) -> Self {
+        match screen {
+            Screen::Predict => Self::Predict,
+            Screen::Scrape => Self::Scrape,
+            Screen::Model => Self::Model,
+            Screen::FighterSearch => Self::FighterSearch,
+            Screen::Fighter { .. } => Self::Fighter,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Snapshot of the bits `interpret_key` needs. Pure so chord behaviour can be
+/// unit-tested without constructing a full `App`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyCtx {
+    picker_open: bool,
+    radar_open: bool,
+    /// `None` = no job overlay; `Some(false)` = running; `Some(true)` = finished.
+    job_finished: Option<bool>,
+    screen: KeyScreen,
+}
+
+/// Outcome of one key after global / Ctrl+letter binding rules, before
+/// per-screen typing and arrows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyIntent {
+    Noop,
+    Quit,
+    GoHome,
+    Pop,
+    DismissJob,
+    CloseSnapshotPicker,
+    CloseRadar,
+    OpenRadar,
+    ClearMatchup,
+    PredictPrime,
+    PredictToggleSnapshot,
+    PredictUpcomingCard,
+    ScrapeToggleFull,
+    ScrapeRun,
+    ModelRefresh,
+    ModelTrain,
+    ModelReload,
+    Forward,
+}
+
+fn is_ctrl_backspace(key: &KeyEvent) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    matches!(key.code, KeyCode::Backspace | KeyCode::Char('h' | 'H'))
+}
+
+fn typing_char(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+fn ctrl_letter(key: &KeyEvent) -> Option<char> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Pure key interpretation: Ctrl+C quits, letter commands are held Ctrl+letter
+/// chords so typing never fires them, and printable letters otherwise Forward
+/// into the focused search field. Ctrl+Q is never quit.
+fn interpret_key(key: &KeyEvent, ctx: &KeyCtx) -> KeyIntent {
+    if ctrl_letter(key) == Some('c') {
+        return KeyIntent::Quit;
+    }
+
+    if ctx.job_finished.is_none() && ctx.screen == KeyScreen::Predict && is_ctrl_backspace(key) {
+        return KeyIntent::ClearMatchup;
+    }
+
+    if let Some(c) = ctrl_letter(key) {
+        return interpret_ctrl_letter(c, ctx);
+    }
+
+    if ctx.job_finished.is_some() {
+        let finished = ctx.job_finished == Some(true);
+        return match key.code {
+            KeyCode::Home if finished => KeyIntent::GoHome,
+            KeyCode::Esc | KeyCode::Enter if finished => KeyIntent::DismissJob,
+            _ => KeyIntent::Noop,
+        };
+    }
+
+    if ctx.radar_open {
+        return match key.code {
+            KeyCode::Home => KeyIntent::GoHome,
+            KeyCode::Esc => KeyIntent::CloseRadar,
+            _ => KeyIntent::Noop,
+        };
+    }
+
+    match key.code {
+        KeyCode::Home => KeyIntent::GoHome,
+        KeyCode::Esc => {
+            if ctx.picker_open {
+                KeyIntent::CloseSnapshotPicker
+            } else {
+                KeyIntent::Pop
+            }
+        }
+        KeyCode::Backspace
+            if !matches!(ctx.screen, KeyScreen::Predict | KeyScreen::FighterSearch) =>
+        {
+            KeyIntent::Pop
+        }
+        _ => KeyIntent::Forward,
+    }
+}
+
+fn interpret_ctrl_letter(c: char, ctx: &KeyCtx) -> KeyIntent {
+    if ctx.job_finished.is_some() {
+        return KeyIntent::Noop;
+    }
+    match (c, ctx.screen) {
+        ('p', KeyScreen::Predict) => KeyIntent::PredictPrime,
+        ('s', KeyScreen::Predict) => KeyIntent::PredictToggleSnapshot,
+        ('u', KeyScreen::Predict) => KeyIntent::PredictUpcomingCard,
+        ('r', KeyScreen::Predict | KeyScreen::FighterSearch | KeyScreen::Fighter) => {
+            KeyIntent::OpenRadar
+        }
+        ('f', KeyScreen::Scrape) => KeyIntent::ScrapeToggleFull,
+        ('r', KeyScreen::Scrape) => KeyIntent::ScrapeRun,
+        ('r', KeyScreen::Model) => KeyIntent::ModelRefresh,
+        ('t', KeyScreen::Model) => KeyIntent::ModelTrain,
+        ('l', KeyScreen::Model) => KeyIntent::ModelReload,
+        _ => KeyIntent::Noop,
+    }
 }
 
 impl App {
@@ -409,6 +614,7 @@ impl App {
             scrape: ScrapeState::default(),
             model: ModelState::default(),
             scrape_traces_status: String::new(),
+            radar: None,
         };
 
         app.refresh_db_summary();
@@ -428,6 +634,7 @@ impl App {
 
     /// Push `screen`, making it current, then load any data it needs.
     pub fn push(&mut self, screen: Screen) {
+        self.radar = None;
         self.nav.push(screen);
         self.on_enter_current();
     }
@@ -435,6 +642,7 @@ impl App {
     /// Pop one level (Esc / Backspace). No-op at the root (Home stays). Returns
     /// true if a pop actually happened.
     pub fn pop(&mut self) -> bool {
+        self.radar = None;
         if self.nav.len() > 1 {
             self.nav.pop();
             self.on_enter_current();
@@ -446,6 +654,7 @@ impl App {
 
     /// Clear the stack back to Home (the Home key).
     pub fn go_home(&mut self) {
+        self.radar = None;
         self.nav.truncate(1); // keep the root Home
         self.home_selected = 0;
         self.on_enter_current();
@@ -572,82 +781,94 @@ impl App {
     // INPUT DISPATCH
     // ======================================================================= //
 
+    fn key_ctx(&self) -> KeyCtx {
+        KeyCtx {
+            picker_open: self.predict.picker_open,
+            radar_open: self.radar.is_some(),
+            job_finished: self.job.as_ref().map(|j| j.status.is_finished()),
+            screen: KeyScreen::of(self.current()),
+        }
+    }
+
     /// Handle one key event, mutating state and possibly triggering side
-    /// effects. Implements the global nav model then per-screen keys.
+    /// effects. Letter commands are held Ctrl+letter chords so search fields
+    /// accept `q` / `s` / `p` / etc. as typed text.
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
-
-        // Ctrl-C always quits.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return Ok(());
-        }
-
-        // While a job is on screen, keys are limited to dismiss / quit / Home so
-        // the loading overlay can't be navigated away from mid-stream.
-        if self.job.is_some() {
-            return self.on_key_job(key);
-        }
-
-        // Global bindings shared by every screen.
-        match key.code {
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                return Ok(());
-            }
-            KeyCode::Home => {
-                self.go_home();
-                return Ok(());
-            }
-            KeyCode::Esc | KeyCode::Backspace => {
-                // On text-entry screens, Backspace edits the query instead of
-                // popping; those screens handle Backspace themselves below.
-                let text_entry = matches!(self.current(), Screen::FighterSearch | Screen::Predict);
-                if key.code == KeyCode::Backspace && text_entry {
-                    // fall through to per-screen handling
-                } else {
-                    self.pop();
-                    return Ok(());
-                }
-            }
-            _ => {}
-        }
-
-        match self.current().clone() {
-            Screen::Home => self.on_key_home(key),
-            Screen::Database => self.on_key_database(key),
-            Screen::Scrape => self.on_key_scrape(key),
-            Screen::Events => self.on_key_events(key),
-            Screen::EventFights { .. } => self.on_key_event_fights(key),
-            Screen::FighterSearch => self.on_key_search(key),
-            Screen::Fighter { .. } => Ok(()), // Esc/Home only (handled above)
-            Screen::Predict => self.on_key_predict(key),
-            Screen::Model => self.on_key_model(key),
-        }
+        self.apply_key_intent(key, interpret_key(&key, &self.key_ctx()))
     }
 
-    /// Keys while a job overlay is visible: dismiss the FINISHED log with
-    /// Esc/Enter, quit with q, jump Home with Home. Running jobs ignore input.
-    fn on_key_job(&mut self, key: KeyEvent) -> Result<()> {
-        let finished = self
-            .job
-            .as_ref()
-            .map(|j| j.status.is_finished())
-            .unwrap_or(false);
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Home if finished => {
-                self.job = None;
+    fn apply_key_intent(&mut self, key: KeyEvent, intent: KeyIntent) -> Result<()> {
+        match intent {
+            KeyIntent::Noop => {}
+            KeyIntent::Quit => self.should_quit = true,
+            KeyIntent::GoHome => {
+                if self.job.as_ref().is_some_and(|j| j.status.is_finished()) {
+                    self.job = None;
+                }
                 self.go_home();
             }
-            KeyCode::Esc | KeyCode::Enter if finished => {
-                self.job = None;
+            KeyIntent::Pop => {
+                self.pop();
             }
-            _ => {}
+            KeyIntent::DismissJob => self.job = None,
+            KeyIntent::CloseSnapshotPicker => self.predict.picker_open = false,
+            KeyIntent::CloseRadar => self.radar = None,
+            KeyIntent::OpenRadar => {
+                if self.radar.is_some() {
+                    self.radar = None;
+                } else {
+                    self.open_radar();
+                }
+            }
+            KeyIntent::ClearMatchup => self.clear_matchup(),
+            KeyIntent::PredictPrime => {
+                if self.predict.both_selected() {
+                    self.toggle_prime_vs_prime();
+                }
+            }
+            KeyIntent::PredictToggleSnapshot => {
+                if self.predict.picker_open {
+                    self.predict.picker_open = false;
+                } else if self.predict.both_selected() {
+                    self.open_snapshot_picker(PredictSlot::A);
+                }
+            }
+            KeyIntent::PredictUpcomingCard => self.predict_latest_upcoming_card(),
+            KeyIntent::ScrapeToggleFull => self.scrape.full = !self.scrape.full,
+            KeyIntent::ScrapeRun => self.start_scrape(),
+            KeyIntent::ModelRefresh => {
+                self.refresh_model_status();
+                self.status_line = Some("Model status refreshed.".to_string());
+            }
+            KeyIntent::ModelTrain => self.start_train(),
+            KeyIntent::ModelReload => {
+                self.reload_sidecar_into_model();
+                self.status_line = Some("Sidecar reloaded model from disk.".to_string());
+            }
+            KeyIntent::Forward => match self.current().clone() {
+                Screen::Home => return self.on_key_home(key),
+                Screen::Database => return self.on_key_database(key),
+                Screen::Scrape => return self.on_key_scrape(key),
+                Screen::Events => return self.on_key_events(key),
+                Screen::EventFights { .. } => return self.on_key_event_fights(key),
+                Screen::FighterSearch => return self.on_key_search(key),
+                Screen::Fighter { .. } => {}
+                Screen::Predict => return self.on_key_predict(key),
+                Screen::Model => return self.on_key_model(key),
+            },
         }
         Ok(())
+    }
+
+    /// Reset both Predict slots and return to an empty manual search.
+    fn clear_matchup(&mut self) {
+        self.radar = None;
+        self.predict.clear_matchup();
+        self.refresh_predict_pool();
+        self.recompute_predict_candidates();
     }
 
     /// Periodic tick: advance the animation clock and drain the job channel,
@@ -873,11 +1094,12 @@ impl App {
                 self.search.query.pop();
                 self.reload_search_list();
             }
-            KeyCode::Char(c) => {
-                self.search.query.push(c);
-                self.reload_search_list();
+            _ => {
+                if let Some(c) = typing_char(key) {
+                    self.search.query.push(c);
+                    self.reload_search_list();
+                }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -910,19 +1132,62 @@ impl App {
         }
     }
 
+    fn radar_subject_names(&self) -> Vec<String> {
+        match self.current() {
+            Screen::Predict => [self.predict.name_a.clone(), self.predict.name_b.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Screen::Fighter { name } => vec![name.clone()],
+            Screen::FighterSearch => self
+                .search
+                .selected_name()
+                .map(|n| vec![n.to_string()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn open_radar(&mut self) {
+        let names = self.radar_subject_names();
+        if names.is_empty() {
+            self.status_line = Some("Pick a fighter first.".to_string());
+            return;
+        }
+        match self.db.load_radar_stats() {
+            Ok(roster) => match crate::radar::build_overlay_from_stats(&names, &roster) {
+                Some(o) => self.radar = Some(o),
+                None => {
+                    self.status_line = Some("No radar stats for that fighter.".to_string());
+                }
+            },
+            Err(e) => self.status_line = Some(format!("Radar load failed: {e}")),
+        }
+    }
+
     // ======================================================================= //
     // PREDICT
     // ======================================================================= //
 
     fn on_key_predict(&mut self, key: KeyEvent) -> Result<()> {
+        if self.radar.is_some() {
+            return Ok(());
+        }
+        // The snapshot picker overlay grabs all keys while open.
+        if self.predict.picker_open {
+            return self.on_key_snapshot_picker(key);
+        }
         match key.code {
             KeyCode::Tab => {
+                self.predict.view = PredictView::Manual;
                 self.cycle_weight_class(1);
             }
             KeyCode::BackTab => {
+                self.predict.view = PredictView::Manual;
                 self.cycle_weight_class(-1);
             }
             KeyCode::Left | KeyCode::Right => {
+                self.predict.view = PredictView::Manual;
                 self.predict.toggle_slot();
                 // The focused slot changed, so its pool now depends on the OTHER
                 // slot's pick — refresh it (sidecar) before re-ranking.
@@ -932,6 +1197,7 @@ impl App {
             KeyCode::Up => self.predict.select_prev(),
             KeyCode::Down => self.predict.select_next(),
             KeyCode::Enter => {
+                self.predict.view = PredictView::Manual;
                 if let Some(name) = self.predict.highlighted_candidate() {
                     let name = name.to_string();
                     self.predict.commit_slot(name.clone());
@@ -947,16 +1213,116 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
+                self.predict.view = PredictView::Manual;
                 self.predict.query.pop();
                 self.recompute_predict_candidates();
             }
-            KeyCode::Char(c) => {
-                self.predict.query.push(c);
-                self.recompute_predict_candidates();
+            _ => {
+                if let Some(c) = typing_char(key) {
+                    self.predict.view = PredictView::Manual;
+                    self.predict.query.push(c);
+                    self.recompute_predict_candidates();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keys while the snapshot-picker overlay is open. Rows are
+    /// `[Current, Prime, <fight 0>, <fight 1>, ...]`; Up/Down navigate, Left/Right
+    /// switch which fighter is being picked, Enter commits the snapshot + re-runs.
+    /// Esc and Ctrl+S close the picker (handled in `interpret_key`).
+    fn on_key_snapshot_picker(&mut self, key: KeyEvent) -> Result<()> {
+        let total = 2 + self.predict.picker_snaps.len(); // Current + Prime + fights
+        match key.code {
+            KeyCode::Up => {
+                self.predict.picker_selected = self.predict.picker_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if self.predict.picker_selected + 1 < total {
+                    self.predict.picker_selected += 1;
+                }
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let other = self.predict.picker_slot.other();
+                let name = match other {
+                    PredictSlot::A => self.predict.name_a.clone(),
+                    PredictSlot::B => self.predict.name_b.clone(),
+                };
+                if let Some(name) = name {
+                    self.open_snapshot_picker_for(other, &name);
+                }
+            }
+            KeyCode::Enter => {
+                let sel = self.snapshot_selector_for_index(self.predict.picker_selected);
+                match self.predict.picker_slot {
+                    PredictSlot::A => self.predict.snap_a = sel,
+                    PredictSlot::B => self.predict.snap_b = sel,
+                }
+                self.predict.picker_open = false;
+                self.maybe_run_prediction();
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Toggle prime-vs-prime: if A is already on its prime, reset BOTH sides to
+    /// current; otherwise set BOTH to prime. Re-runs the prediction.
+    fn toggle_prime_vs_prime(&mut self) {
+        let already_prime =
+            matches!(&self.predict.snap_a, Some(SnapSelector::Anchor(s)) if s == "prime");
+        if already_prime {
+            self.predict.snap_a = None;
+            self.predict.snap_b = None;
+            self.status_line = Some("Snapshots reset to current.".to_string());
+        } else {
+            self.predict.snap_a = Some(SnapSelector::Anchor("prime".to_string()));
+            self.predict.snap_b = Some(SnapSelector::Anchor("prime".to_string()));
+            self.status_line = Some("Prime vs prime.".to_string());
+        }
+        self.maybe_run_prediction();
+    }
+
+    /// Open the snapshot picker for `slot`, fetching that fighter's timeline.
+    fn open_snapshot_picker(&mut self, slot: PredictSlot) {
+        let name = match slot {
+            PredictSlot::A => self.predict.name_a.clone(),
+            PredictSlot::B => self.predict.name_b.clone(),
+        };
+        if let Some(name) = name {
+            self.open_snapshot_picker_for(slot, &name);
+        }
+    }
+
+    fn open_snapshot_picker_for(&mut self, slot: PredictSlot, name: &str) {
+        match self.sidecar.timeline(name) {
+            Ok(snaps) => {
+                self.predict.picker_open = true;
+                self.predict.picker_slot = slot;
+                self.predict.picker_snaps = snaps;
+                self.predict.picker_selected = 0;
+            }
+            Err(e) => {
+                self.predict.picker_open = false;
+                self.status_line = Some(format!("Timeline failed: {e}"));
+            }
+        }
+    }
+
+    /// Map a picker row index to a snapshot selector: 0 = Current (`None`),
+    /// 1 = Prime, 2.. = the corresponding fight (`{fight_id}`).
+    fn snapshot_selector_for_index(&self, idx: usize) -> Option<SnapSelector> {
+        match idx {
+            0 => None,
+            1 => Some(SnapSelector::Anchor("prime".to_string())),
+            i => self
+                .predict
+                .picker_snaps
+                .get(i - 2)
+                .and_then(|s| s.fight_id)
+                .map(|fight_id| SnapSelector::Fight { fight_id }),
+        }
     }
 
     /// After committing `just_committed` in the focused slot, check the OTHER
@@ -980,8 +1346,14 @@ impl App {
 
         if !pool.iter().any(|n| n == &other_name) {
             match self.predict.slot.other() {
-                PredictSlot::A => self.predict.name_a = None,
-                PredictSlot::B => self.predict.name_b = None,
+                PredictSlot::A => {
+                    self.predict.name_a = None;
+                    self.predict.snap_a = None;
+                }
+                PredictSlot::B => {
+                    self.predict.name_b = None;
+                    self.predict.snap_b = None;
+                }
             }
             self.predict.result = None;
             self.predict.error = None;
@@ -1084,10 +1456,12 @@ impl App {
     }
 
     fn maybe_run_prediction(&mut self) {
+        self.predict.view = PredictView::Manual;
         let (Some(a), Some(b)) = (self.predict.name_a.clone(), self.predict.name_b.clone()) else {
             return;
         };
-        match self.sidecar.predict(&a, &b) {
+        let (snap_a, snap_b) = (self.predict.snap_a.clone(), self.predict.snap_b.clone());
+        match self.sidecar.predict(&a, &b, snap_a, snap_b) {
             Ok(result) => {
                 self.predict.result = Some(result);
                 self.predict.error = None;
@@ -1101,22 +1475,101 @@ impl App {
         }
     }
 
+    /// Predict every fight on the next future-dated event in the scraped DB.
+    /// Uses the sidecar's single-fight predictor for each row so the Python model
+    /// remains the only source of prediction behavior.
+    fn predict_latest_upcoming_card(&mut self) {
+        self.predict.view = PredictView::UpcomingCard;
+        self.predict.card_event = None;
+        self.predict.card_predictions.clear();
+        self.predict.card_error = None;
+
+        let event = match self.db.next_upcoming_event() {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                self.predict.card_error =
+                    Some("No upcoming event found in the scraped database.".to_string());
+                self.status_line = Some("No upcoming event found.".to_string());
+                return;
+            }
+            Err(e) => {
+                self.predict.card_error = Some(format!("Upcoming card lookup failed: {e}"));
+                self.status_line = Some(format!("Upcoming card lookup failed: {e}"));
+                return;
+            }
+        };
+
+        let fights = match self.db.fights_for_event(event.event_id) {
+            Ok(fights) => fights,
+            Err(e) => {
+                self.predict.card_event = Some(event);
+                self.predict.card_error = Some(format!("Card load failed: {e}"));
+                self.status_line = Some(format!("Card load failed: {e}"));
+                return;
+            }
+        };
+
+        if fights.is_empty() {
+            self.predict.card_event = Some(event);
+            self.predict.card_error = Some("Upcoming card has no fights recorded.".to_string());
+            self.status_line = Some("Upcoming card has no fights recorded.".to_string());
+            return;
+        }
+
+        let title = event.title.clone();
+        self.predict.card_event = Some(event);
+
+        let mut rows = Vec::with_capacity(fights.len());
+        for fight in fights {
+            let Some((a, b)) = fight_prediction_names(&fight) else {
+                rows.push(UpcomingFightPrediction {
+                    fight,
+                    fighter_a: None,
+                    fighter_b: None,
+                    result: None,
+                    error: Some("missing fighter names".to_string()),
+                });
+                continue;
+            };
+
+            match self.sidecar.predict(&a, &b, None, None) {
+                Ok(result) => rows.push(UpcomingFightPrediction {
+                    fight,
+                    fighter_a: Some(a),
+                    fighter_b: Some(b),
+                    result: Some(result),
+                    error: None,
+                }),
+                Err(e) => rows.push(UpcomingFightPrediction {
+                    fight,
+                    fighter_a: Some(a),
+                    fighter_b: Some(b),
+                    result: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+
+        let predicted = rows
+            .iter()
+            .filter(|row| row.result.as_ref().map(|r| r.allowed).unwrap_or(false))
+            .count();
+        let total = rows.len();
+        self.predict.card_predictions = rows;
+        self.status_line = Some(format!("Predicted {predicted}/{total} fights for {title}."));
+    }
+
     // ======================================================================= //
     // SCRAPE  (async, non-blocking)
     // ======================================================================= //
 
     fn on_key_scrape(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('f') => self.scrape.full = !self.scrape.full,
             KeyCode::Char('+') | KeyCode::Char('=') => self.scrape.bump_limit(50),
             KeyCode::Char('-') | KeyCode::Char('_') => self.scrape.bump_limit(-50),
             KeyCode::Char('[') => self.scrape.bump_rate(-0.5),
             KeyCode::Char(']') => self.scrape.bump_rate(0.5),
-            KeyCode::Char('c') => {
-                // Clearing the log only makes sense for a dismissed job; the
-                // running-job log lives on the job itself. No-op here otherwise.
-            }
-            KeyCode::Enter | KeyCode::Char('r') => self.start_scrape(),
+            KeyCode::Enter => self.start_scrape(),
             _ => {}
         }
         Ok(())
@@ -1150,17 +1603,8 @@ impl App {
     // ======================================================================= //
 
     fn on_key_model(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Char('r') => {
-                self.refresh_model_status();
-                self.status_line = Some("Model status refreshed.".to_string());
-            }
-            KeyCode::Char('l') => {
-                self.reload_sidecar_into_model();
-                self.status_line = Some("Sidecar reloaded model from disk.".to_string());
-            }
-            KeyCode::Char('t') | KeyCode::Enter => self.start_train(),
-            _ => {}
+        if key.code == KeyCode::Enter {
+            self.start_train();
         }
         Ok(())
     }
@@ -1204,13 +1648,25 @@ impl App {
     /// one-shot intro is still playing on Home. When neither is true the screen
     /// is static and the loop can idle on a slow input poll to keep the CPU calm.
     pub fn is_animating(&self) -> bool {
-        // A running job animates the spinner/progress/fighters; a FINISHED job's
+        // A running job animates the spinner/progress strip; a FINISHED job's
         // overlay is frozen (see ui::loading), so it does NOT keep us redrawing.
         let job_running = matches!(self.job_status(), Some(JobStatus::Running));
         let intro_playing =
             matches!(self.current(), Screen::Home) && !crate::anim::intro_done(self.anim_frame());
         job_running || intro_playing
     }
+}
+
+/// Extract the two fighter slots from a stored fight row for prediction. Completed
+/// fights use winner/loser names; future cards may use the same columns simply as
+/// the two scheduled competitors. Empty names are treated as missing.
+fn fight_prediction_names(fight: &FightRow) -> Option<(String, String)> {
+    let a = fight.winner_name.as_deref()?.trim();
+    let b = fight.loser_name.as_deref()?.trim();
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    Some((a.to_string(), b.to_string()))
 }
 
 // =========================================================================== //
@@ -1280,9 +1736,17 @@ impl PredictState {
     }
 
     pub fn commit_slot(&mut self, name: String) {
+        // A new fighter resets that slot's snapshot to current (a prime/fight_id
+        // from a previous fighter is meaningless for this one).
         match self.slot {
-            PredictSlot::A => self.name_a = Some(name),
-            PredictSlot::B => self.name_b = Some(name),
+            PredictSlot::A => {
+                self.name_a = Some(name);
+                self.snap_a = None;
+            }
+            PredictSlot::B => {
+                self.name_b = Some(name);
+                self.snap_b = None;
+            }
         }
         self.query.clear();
         self.selected = 0;
@@ -1320,8 +1784,14 @@ impl PredictState {
         };
         if stale.is_some() {
             match self.slot {
-                PredictSlot::A => self.name_a = None,
-                PredictSlot::B => self.name_b = None,
+                PredictSlot::A => {
+                    self.name_a = None;
+                    self.snap_a = None;
+                }
+                PredictSlot::B => {
+                    self.name_b = None;
+                    self.snap_b = None;
+                }
             }
             // The slot reverts to picking, so reset the query/highlight.
             self.query.clear();
@@ -1371,6 +1841,27 @@ impl PredictState {
 
     pub fn both_selected(&self) -> bool {
         self.name_a.is_some() && self.name_b.is_some()
+    }
+
+    /// Wipe both fighter slots, snapshots, the last result, and the upcoming-card
+    /// view, then return focus to slot A with an empty query.
+    pub fn clear_matchup(&mut self) {
+        self.name_a = None;
+        self.name_b = None;
+        self.snap_a = None;
+        self.snap_b = None;
+        self.result = None;
+        self.error = None;
+        self.query.clear();
+        self.selected = 0;
+        self.slot = PredictSlot::A;
+        self.view = PredictView::Manual;
+        self.card_event = None;
+        self.card_predictions.clear();
+        self.card_error = None;
+        self.picker_open = false;
+        self.picker_snaps.clear();
+        self.picker_selected = 0;
     }
 }
 
@@ -1655,6 +2146,34 @@ mod tests {
     }
 
     #[test]
+    fn fight_prediction_names_requires_two_non_empty_names() {
+        let mut fight = FightRow {
+            fight_id: 1,
+            event_id: Some(1),
+            event_name: None,
+            date: None,
+            winner_name: Some("  Israel Adesanya  ".into()),
+            loser_name: Some("Robert Whittaker".into()),
+            weight_class: Some("Middleweight".into()),
+            title_bout: 0,
+            method: None,
+            round_ended: 0,
+            time_ended: 0,
+            referee: None,
+        };
+        assert_eq!(
+            fight_prediction_names(&fight),
+            Some(("Israel Adesanya".into(), "Robert Whittaker".into()))
+        );
+
+        fight.loser_name = Some("   ".into());
+        assert_eq!(fight_prediction_names(&fight), None);
+        fight.winner_name = None;
+        fight.loser_name = Some("Robert Whittaker".into());
+        assert_eq!(fight_prediction_names(&fight), None);
+    }
+
+    #[test]
     fn set_pool_keeps_an_eligible_focused_pick() {
         // Focused slot B holds "Bob", which is still in the new (eligible) pool:
         // nothing is dropped.
@@ -1920,5 +2439,297 @@ mod tests {
         tx.send(JobMsg::Done(false)).unwrap();
         assert_eq!(job.drain(), Some(false));
         assert_eq!(job.status, JobStatus::Failed);
+    }
+
+    // ----------------------------------------------------------------------- //
+    // CTRL+LETTER CHORDS + CLEAR MATCHUP
+    // ----------------------------------------------------------------------- //
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn ctx_screen(screen: KeyScreen) -> KeyCtx {
+        KeyCtx {
+            picker_open: false,
+            radar_open: false,
+            job_finished: None,
+            screen,
+        }
+    }
+
+    fn ctx_predict() -> KeyCtx {
+        ctx_screen(KeyScreen::Predict)
+    }
+
+    fn ctx_home() -> KeyCtx {
+        ctx_screen(KeyScreen::Other)
+    }
+
+    #[test]
+    fn clear_matchup_wipes_picks_snaps_result_and_card() {
+        let mut p = PredictState {
+            view: PredictView::UpcomingCard,
+            slot: PredictSlot::B,
+            name_a: Some("Alex".into()),
+            name_b: Some("Bob".into()),
+            snap_a: Some(SnapSelector::Anchor("prime".into())),
+            snap_b: Some(SnapSelector::Fight { fight_id: 9 }),
+            query: "bo".into(),
+            selected: 2,
+            result: Some(PredictResult {
+                name_a: "Alex".into(),
+                name_b: "Bob".into(),
+                allowed: true,
+                reason: None,
+                prob_a: Some(0.62),
+                prob_b: Some(0.38),
+                low_confidence: false,
+                distance: None,
+                tale_a: None,
+                tale_b: None,
+                model: None,
+                test_accuracy: None,
+                snap_a_label: None,
+                snap_b_label: None,
+                method_probs: None,
+            }),
+            error: Some("stale".into()),
+            picker_open: true,
+            card_event: Some(EventRow {
+                event_id: 1,
+                title: "UFC 1".into(),
+                date: None,
+                location: None,
+            }),
+            card_error: Some("nope".into()),
+            ..Default::default()
+        };
+        p.clear_matchup();
+        assert_eq!(p.name_a, None);
+        assert_eq!(p.name_b, None);
+        assert_eq!(p.snap_a, None);
+        assert_eq!(p.snap_b, None);
+        assert_eq!(p.result, None);
+        assert_eq!(p.error, None);
+        assert_eq!(p.query, "");
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.slot, PredictSlot::A);
+        assert_eq!(p.view, PredictView::Manual);
+        assert!(p.card_event.is_none());
+        assert!(p.card_predictions.is_empty());
+        assert_eq!(p.card_error, None);
+        assert!(!p.picker_open);
+    }
+
+    #[test]
+    fn interpret_key_typing_q_s_p_on_predict_forwards() {
+        let ctx = ctx_predict();
+        for c in ['q', 's', 'p', 'r', 'u'] {
+            assert_eq!(
+                interpret_key(&press(KeyCode::Char(c)), &ctx),
+                KeyIntent::Forward,
+                "bare {c} on Predict must type, not fire a command"
+            );
+        }
+        assert_eq!(
+            interpret_key(&press(KeyCode::Char('q')), &ctx_home()),
+            KeyIntent::Forward,
+            "bare q on Home must not quit"
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_c_quits_and_ctrl_q_never_does() {
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('c')), &ctx_home()),
+            KeyIntent::Quit
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('C')), &ctx_predict()),
+            KeyIntent::Quit
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('q')), &ctx_home()),
+            KeyIntent::Noop,
+            "Ctrl+Q must never quit"
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('Q')), &ctx_predict()),
+            KeyIntent::Noop,
+            "Ctrl+Q must never quit"
+        );
+        assert_eq!(
+            interpret_key(&press(KeyCode::Char('q')), &ctx_home()),
+            KeyIntent::Forward,
+            "bare q must not quit"
+        );
+    }
+
+    #[test]
+    fn interpret_key_esc_closes_snapshot_picker_not_pop() {
+        let mut ctx = ctx_predict();
+        ctx.picker_open = true;
+        assert_eq!(
+            interpret_key(&press(KeyCode::Esc), &ctx),
+            KeyIntent::CloseSnapshotPicker
+        );
+    }
+
+    #[test]
+    fn interpret_key_esc_closes_radar_not_pop() {
+        let mut ctx = ctx_predict();
+        ctx.radar_open = true;
+        ctx.picker_open = true;
+        assert_eq!(
+            interpret_key(&press(KeyCode::Esc), &ctx),
+            KeyIntent::CloseRadar
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('r')), &ctx),
+            KeyIntent::OpenRadar,
+            "Ctrl+R should still toggle radar while the overlay is open"
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_r_opens_radar_on_fighter_screens() {
+        for screen in [
+            KeyScreen::Predict,
+            KeyScreen::FighterSearch,
+            KeyScreen::Fighter,
+        ] {
+            assert_eq!(
+                interpret_key(&ctrl(KeyCode::Char('r')), &ctx_screen(screen)),
+                KeyIntent::OpenRadar,
+                "Ctrl+R on {screen:?} must open radar"
+            );
+            assert_eq!(
+                interpret_key(&ctrl(KeyCode::Char('R')), &ctx_screen(screen)),
+                KeyIntent::OpenRadar,
+                "Ctrl+R (uppercase) on {screen:?} must open radar"
+            );
+        }
+        assert_eq!(
+            interpret_key(&press(KeyCode::Char('r')), &ctx_predict()),
+            KeyIntent::Forward,
+            "bare r on Predict must type, not open radar"
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_r_stays_run_on_scrape_and_refresh_on_model() {
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('r')), &ctx_screen(KeyScreen::Scrape)),
+            KeyIntent::ScrapeRun
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('r')), &ctx_screen(KeyScreen::Model)),
+            KeyIntent::ModelRefresh
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_backspace_and_ctrl_h_clear_matchup() {
+        let ctx = ctx_predict();
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Backspace), &ctx),
+            KeyIntent::ClearMatchup
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('h')), &ctx),
+            KeyIntent::ClearMatchup
+        );
+        assert_eq!(
+            interpret_key(&press(KeyCode::Backspace), &ctx),
+            KeyIntent::Forward,
+            "plain Backspace still edits the query"
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_letter_commands_and_unknown_is_noop() {
+        let ctx = ctx_predict();
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('p')), &ctx),
+            KeyIntent::PredictPrime
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('s')), &ctx),
+            KeyIntent::PredictToggleSnapshot
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('u')), &ctx),
+            KeyIntent::PredictUpcomingCard
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('x')), &ctx),
+            KeyIntent::Noop
+        );
+
+        let scrape = ctx_screen(KeyScreen::Scrape);
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('f')), &scrape),
+            KeyIntent::ScrapeToggleFull
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('s')), &scrape),
+            KeyIntent::Noop
+        );
+
+        let model = ctx_screen(KeyScreen::Model);
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('t')), &model),
+            KeyIntent::ModelTrain
+        );
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('l')), &model),
+            KeyIntent::ModelReload
+        );
+    }
+
+    #[test]
+    fn interpret_key_ctrl_s_toggles_snapshot_picker() {
+        let mut ctx = ctx_predict();
+        ctx.picker_open = true;
+        assert_eq!(
+            interpret_key(&ctrl(KeyCode::Char('s')), &ctx),
+            KeyIntent::PredictToggleSnapshot
+        );
+        assert_eq!(
+            interpret_key(&press(KeyCode::Esc), &ctx),
+            KeyIntent::CloseSnapshotPicker
+        );
+    }
+
+    #[test]
+    fn footer_hints_use_ctrl_letter_chords() {
+        assert!(Screen::Home.footer_hint().contains("^C quit"));
+        assert!(!Screen::Home.footer_hint().contains("^Q"));
+        assert!(!Screen::Home.footer_hint().contains("q Quit"));
+        let predict = Screen::Predict.footer_hint();
+        assert!(predict.contains("^P/^S/^U"));
+        assert!(predict.contains("^R radar"));
+        assert!(predict.contains("^⌫ clear"));
+        assert!(predict.contains("^C quit"));
+        assert!(!predict.contains("^Q"));
+        assert!(Screen::FighterSearch.footer_hint().contains("^R radar"));
+        assert!(
+            Screen::Fighter { name: "x".into() }
+                .footer_hint()
+                .contains("^R radar")
+        );
+        assert!(Screen::Scrape.footer_hint().contains("^F full"));
+        assert!(Screen::Scrape.footer_hint().contains("⏎/^R run"));
+        assert!(!Screen::Scrape.footer_hint().contains("radar"));
+        assert!(!Screen::Scrape.footer_hint().contains("^Q"));
+        assert!(Screen::Model.footer_hint().contains("^T train"));
+        assert!(Screen::Model.footer_hint().contains("^L reload"));
+        assert!(Screen::Model.footer_hint().contains("^R refresh"));
+        assert!(!Screen::Model.footer_hint().contains("^Q"));
     }
 }

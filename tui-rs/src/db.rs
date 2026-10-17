@@ -163,6 +163,29 @@ impl Db {
         Ok(out)
     }
 
+    /// Career columns for the radar overlay: name plus the six higher-is-better
+    /// axes (slpm, str_acc, str_def, td_avg, td_def, sub_avg). sapm is omitted.
+    pub fn load_radar_stats(&self) -> Result<Vec<(String, [Option<f64>; 6])>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, slpm, str_acc, str_def, td_avg, td_def, sub_avg \
+             FROM fighters ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                [
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ],
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Fighters whose name matches `query` (case-insensitive substring /
     /// SQL-side filter). Empty `query` returns all fighters. Ordered by name.
     ///
@@ -294,6 +317,27 @@ impl Db {
         }))
     }
 
+    /// The next scheduled event in the DB: earliest non-empty date on or after
+    /// SQLite's local current date. Used by the Predict screen's whole-card
+    /// action. Returns `None` when the scraped DB has no future-dated events.
+    pub fn next_upcoming_event(&self) -> Result<Option<EventRow>> {
+        let today: String = self
+            .conn
+            .query_row("SELECT date('now','localtime')", [], |r| r.get(0))?;
+        self.next_upcoming_event_on_or_after(&today)
+    }
+
+    /// Earliest non-empty event date on or after the ISO `YYYY-MM-DD` cutoff.
+    pub fn next_upcoming_event_on_or_after(&self, today_iso: &str) -> Result<Option<EventRow>> {
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events \
+             WHERE date IS NOT NULL AND date <> '' AND date >= ?1 \
+             ORDER BY date ASC, event_id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt.query_row([today_iso], map_event).optional()?)
+    }
+
     /// DB-wide counts and date span for Home / Model screens.
     pub fn summary(&self) -> Result<DbSummary> {
         let n_fighters: i64 = self
@@ -336,11 +380,19 @@ impl Db {
 /// Parse the card number out of a numbered UFC title like `"UFC 311"` ->
 /// `Some(311)`. Returns `None` for non-numbered titles (`"UFC Fight Night"`,
 /// `"UFC on ESPN 42"` etc.) — only a title whose first whitespace-separated
-/// token after `"UFC"` is purely digits counts. Pure helper, unit-tested below.
+/// token after `"UFC"` is digits, optionally followed by punctuation (the real
+/// `"UFC 331: Van vs. Pantoja 2"` shape), counts. Pure helper, unit-tested below.
 pub fn parse_card_number(title: &str) -> Option<u32> {
     let rest = title.strip_prefix("UFC ")?;
     let token = rest.split_whitespace().next()?;
-    token.parse::<u32>().ok()
+    let digits_end = token
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(token.len());
+    let (digits, tail) = token.split_at(digits_end);
+    if tail.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    digits.parse::<u32>().ok()
 }
 
 #[cfg(test)]
@@ -352,6 +404,9 @@ mod tests {
         assert_eq!(parse_card_number("UFC 311"), Some(311));
         assert_eq!(parse_card_number("UFC 1"), Some(1));
         assert_eq!(parse_card_number("UFC 300"), Some(300));
+        // Real scraped titles carry the billing after a colon.
+        assert_eq!(parse_card_number("UFC 331: Van vs. Pantoja 2"), Some(331));
+        assert_eq!(parse_card_number("UFC 300: Pereira vs. Hill"), Some(300));
     }
 
     #[test]
@@ -361,5 +416,7 @@ mod tests {
         assert_eq!(parse_card_number("UFC Fight Night: Smith vs Jones"), None);
         assert_eq!(parse_card_number("PFL 5"), None);
         assert_eq!(parse_card_number("UFC"), None);
+        assert_eq!(parse_card_number("UFC 2B"), None);
+        assert_eq!(parse_card_number("UFC :"), None);
     }
 }

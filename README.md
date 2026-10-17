@@ -58,7 +58,7 @@ rely on is documented in [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
 |---|---|---|
 | `scraper-go/` | Go 1.26+ (no CGO) | goquery, `golang.org/x/time`, `modernc.org/sqlite` |
 | `ml/` | Python 3.10+ (3.11 tested) | pandas, numpy, scikit-learn, matplotlib, seaborn, mlxtend (umap optional), joblib |
-| `tui-rs/` | Rust (stable) | ratatui, rusqlite, ratatui-image |
+| `tui-rs/` | Rust (stable) | ratatui, crossterm, rusqlite, fuzzy-matcher, serde |
 | storage | SQLite (WAL) | shared `data/ufc.db` (gitignored, built locally) |
 
 The trained predictor lives at `ml/models/predictor.joblib` (gitignored);
@@ -139,6 +139,7 @@ mma-stats-pipeline/
 ├── mma                      Launcher: builds on first run, then starts the TUI
 ├── Makefile                 Root task hub (run / build / test / train / …)
 ├── install.sh               curl | sh installer
+├── flake.nix                Nix dev shell (Rust + Python toolchains)
 ├── tui-rs/                  Rust terminal UI (the control center)
 ├── scraper-go/              Go scraper - sole writer of data/ufc.db
 ├── ml/                      Python ML: archetypes, relationships, predictor
@@ -159,6 +160,10 @@ weight in lbs, times in seconds, dates as ISO `YYYY-MM-DD`. The full DDL and
 conventions are in [docs/SCHEMA_CONTRACT.md](docs/SCHEMA_CONTRACT.md).
 
 ## Tests
+
+The repo's `flake.nix` pins the Rust and Python toolchains (rustc, cargo, clippy,
+nextest, python3, uv, ruff); Go comes from your machine. With Nix, run any
+command inside that shell, e.g. `nix develop -c make test`.
 
 ```sh
 make test                                    # everything

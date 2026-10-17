@@ -23,13 +23,17 @@
 //! - a sidecar that exits without answering is handled gracefully (an `Err`, no
 //!   panic / hang).
 
+// The `#[path]`-included modules are whole `src/` files; each test crate only
+// exercises a slice of them, so the rest is legitimately unused here.
+#![allow(dead_code)]
+
 // Mirror the crate's module tree so `crate::config` / `crate::models` / `crate::otel` resolve.
-#[path = "../src/otel.rs"]
-mod otel;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/models.rs"]
 mod models;
+#[path = "../src/otel.rs"]
+mod otel;
 #[path = "../src/sidecar.rs"]
 mod sidecar;
 
@@ -203,7 +207,7 @@ for raw in sys.stdin:
 "#;
     let mut sc = Sidecar::from_command(stub_command(STRICT_STUB)).expect("spawn strict stub");
     sc.ping().expect("ping proves well-formed request line");
-    let _ = sc.predict("a", "b"); // predict carries extra fields; framing still valid
+    let _ = sc.predict("a", "b", None, None); // predict carries extra fields; framing still valid
 }
 
 #[test]
@@ -252,11 +256,17 @@ fn eligibility_returns_rules_and_divisions() {
     assert!(!payload.rules.allow_cross_gender);
     assert!(payload.rules.allow_unknown_division);
     // DIVISIONS: per-fighter [gender, ordinal] pairs deserialize into Division.
-    let jj = payload.divisions.get("Jon Jones").expect("Jon Jones present");
+    let jj = payload
+        .divisions
+        .get("Jon Jones")
+        .expect("Jon Jones present");
     assert_eq!(jj.len(), 1);
     assert_eq!(jj[0].gender(), "M");
     assert_eq!(jj[0].ordinal(), 7);
-    let stipe = payload.divisions.get("Stipe Miocic").expect("Stipe present");
+    let stipe = payload
+        .divisions
+        .get("Stipe Miocic")
+        .expect("Stipe present");
     assert_eq!(stipe[0].ordinal(), 8);
 }
 
@@ -301,7 +311,7 @@ fn eligibility_surfaces_model_not_trained_as_err() {
 fn predict_parses_full_result_with_nulls() {
     let mut sc = Sidecar::from_command(stub_command(STUB)).expect("spawn stub");
     let res = sc
-        .predict("Jon Jones", "Stipe Miocic")
+        .predict("Jon Jones", "Stipe Miocic", None, None)
         .expect("predict should succeed");
 
     assert_eq!(res.name_a, "Jon Jones");
@@ -337,7 +347,7 @@ fn predict_parses_full_result_with_nulls() {
 fn predict_surfaces_ok_false_as_err() {
     let mut sc = Sidecar::from_command(stub_command(STUB)).expect("spawn stub");
     let err = sc
-        .predict("__nomodel__", "anyone")
+        .predict("__nomodel__", "anyone", None, None)
         .expect_err("predict must Err when model not trained");
     assert!(
         err.to_string().contains("model not trained"),
@@ -362,7 +372,7 @@ fn many_sequential_calls_all_correlate() {
     sc.ping().expect("call 1");
     let _ = sc.status().expect("call 2");
     let _ = sc.roster().expect("call 3");
-    let _ = sc.predict("a", "b").expect("call 4");
+    let _ = sc.predict("a", "b", None, None).expect("call 4");
     let _ = sc.reload().expect("call 5");
     sc.ping().expect("call 6");
 }
@@ -462,7 +472,7 @@ fn fixture_stub_sidecar_speaks_protocol_via_start() {
 
     let status = sc.status().expect("status ok");
     assert!(status.model_loaded);
-    assert_eq!(status.n_fighters, 3);
+    assert_eq!(status.n_fighters, 4);
 
     let roster = sc.roster().expect("roster ok");
     assert_eq!(
@@ -470,13 +480,14 @@ fn fixture_stub_sidecar_speaks_protocol_via_start() {
         vec![
             "Alex Pereira".to_string(),
             "Israel Adesanya".to_string(),
+            "Joaquin Buckley".to_string(),
             "Robert Whittaker".to_string(),
         ]
     );
 
     let reload = sc.reload().expect("reload ok");
     assert!(reload.model_loaded);
-    assert_eq!(reload.n_fighters, 3);
+    assert_eq!(reload.n_fighters, 4);
 }
 
 #[test]
@@ -487,7 +498,7 @@ fn fixture_stub_predict_matches_rust_model_exactly() {
     let mut sc = Sidecar::start(&cfg).expect("start fixture stub sidecar");
 
     let res = sc
-        .predict("Israel Adesanya", "Robert Whittaker")
+        .predict("Israel Adesanya", "Robert Whittaker", None, None)
         .expect("predict ok");
 
     assert_eq!(res.name_a, "Israel Adesanya");
@@ -520,17 +531,60 @@ fn fixture_stub_predict_matches_rust_model_exactly() {
     assert_eq!(b.elo, Some(1580.0));
     assert_eq!(b.reach_in, Some(73.5));
     assert_eq!(b.divisions, vec!["Middleweight".to_string()]);
+
+    // Snapshot labels default to "current"; the method split is coherent (each
+    // fighter's three method probs sum to that fighter's win probability).
+    assert_eq!(res.snap_a_label.as_deref(), Some("current"));
+    assert_eq!(res.snap_b_label.as_deref(), Some("current"));
+    let mp = res.method_probs.expect("method_probs present");
+    let sum_a = mp.a.decision.unwrap() + mp.a.ko_tko.unwrap() + mp.a.submission.unwrap();
+    let sum_b = mp.b.decision.unwrap() + mp.b.ko_tko.unwrap() + mp.b.submission.unwrap();
+    assert!(
+        (sum_a - 0.62).abs() < 1e-9,
+        "A method probs sum to P(A win)"
+    );
+    assert!(
+        (sum_b - 0.38).abs() < 1e-9,
+        "B method probs sum to P(B win)"
+    );
+    // Both fighters carry their own "if they win" split, each summing to 1.
+    for (side, given) in [("A", mp.a_given_win), ("B", mp.b_given_win)] {
+        let g = given.unwrap_or_else(|| panic!("{side} given-win split present"));
+        let sum = g.decision.unwrap() + g.ko_tko.unwrap() + g.submission.unwrap();
+        assert!((sum - 1.0).abs() < 1e-9, "{side} given-win split sums to 1");
+    }
+}
+
+#[test]
+fn fixture_stub_timeline_and_prime_selector() {
+    // The `timeline` client returns a fighter's selectable snapshots, and a prime
+    // snapshot selector flows through predict and is echoed in the label.
+    let cfg = fixture_sidecar_config();
+    let mut sc = Sidecar::start(&cfg).expect("start fixture stub sidecar");
+
+    let snaps = sc.timeline("Israel Adesanya").expect("timeline ok");
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(snaps[1].fight_id, Some(102));
+    assert!(snaps[1].is_prime);
+    assert_eq!(snaps.iter().filter(|s| s.is_prime).count(), 1);
+
+    let res = sc
+        .predict(
+            "Israel Adesanya",
+            "Robert Whittaker",
+            Some(models::SnapSelector::Anchor("prime".into())),
+            None,
+        )
+        .expect("predict with prime selector ok");
+    assert_eq!(res.snap_a_label.as_deref(), Some("prime (2019-10-05)"));
+    assert_eq!(res.snap_b_label.as_deref(), Some("current"));
 }
 
 /// Local eligibility filter over a roster: every name `b != a` whose matchup with
 /// `a` the fetched `rules` allow, sorted. Mirrors `app::EligibilityState::
 /// eligible_opponents` so this test exercises the SAME local-filter logic the TUI
 /// uses (zero per-selection IPC).
-fn local_eligible(
-    a: &str,
-    roster: &[&str],
-    payload: &models::EligibilityPayload,
-) -> Vec<String> {
+fn local_eligible(a: &str, roster: &[&str], payload: &models::EligibilityPayload) -> Vec<String> {
     let empty: Vec<models::Division> = Vec::new();
     let divs_a = payload.divisions.get(a).unwrap_or(&empty);
     let mut out: Vec<String> = roster

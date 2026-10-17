@@ -13,7 +13,7 @@
 //!     MENU: Scrape / Database / Predict / Model.
 //!   * NAVIGATION is a SCREEN STACK with NO hotkey jumps. On a menu, ↑/↓ move the
 //!     selection and ⏎ pushes the chosen screen; Esc AND Backspace pop one level;
-//!     the Home key clears back to the home menu; q quits. A persistent FOOTER
+//!     the Home key clears back to the home menu; Ctrl+C quits. A persistent FOOTER
 //!     shows the contextual controls (e.g. "↑↓ move · ⏎ select · …").
 //!   * DATABASE is a hub with two working paths: "Browse events" (events → a card
 //!     → a fighter) and "Find a fighter" (live fuzzy search → a fighter profile).
@@ -25,11 +25,11 @@
 //! env overrides resolved in `src/config.rs`, so there is NO network, NO real
 //! model and NO real DB writes:
 //!   * `MMA_DB`      -> a tiny temp SQLite DB seeded here (4 contract tables +
-//!                      the same known fighters as the stub roster).
+//!     the same known fighters as the stub roster).
 //!   * `MMA_SIDECAR` -> `tests/fixtures/stub_sidecar.py` (canned IPC responses).
 //!   * `MMA_SCRAPER` -> `tests/fixtures/stub_scraper.sh` (canned progress lines,
-//!                      with a small sleep between each so streaming + the
-//!                      non-blocking loop are OBSERVABLE mid-run).
+//!     with a small sleep between each so streaming + the non-blocking loop are
+//!     OBSERVABLE mid-run).
 //!
 //! Timing: the TUI redraws on a 100ms tick and external processes (sidecar,
 //! scraper) run asynchronously, so EVERY assertion is preceded by a poll that
@@ -68,6 +68,14 @@ const HOME: &str = "\x1b[H";
 #[allow(dead_code)]
 const TAB: &str = "\t";
 const CTRL_C: &str = "\x03";
+const CTRL_R: &str = "\x12";
+const CTRL_P: &str = "\x10";
+const CTRL_S: &str = "\x13";
+const CTRL_U: &str = "\x15";
+const CTRL_F: &str = "\x06";
+const CTRL_T: &str = "\x14";
+const CTRL_L: &str = "\x0c";
+const CTRL_BACKSPACE: &str = "\x08";
 const BACKSPACE: &str = "\x7f";
 
 /// Fixed PTY geometry for every session (rows x cols).
@@ -148,7 +156,7 @@ struct TempDb {
 
 impl TempDb {
     /// Create a fresh temp DB, build the 4 contract tables, and seed the known
-    /// roster (the same 3 names the stub sidecar serves, plus a couple of others
+    /// roster (the same names the stub sidecar serves, plus a couple of others
     /// so we can prove the fighter search NARROWS rather than always showing
     /// everything).
     fn new() -> TempDb {
@@ -319,6 +327,13 @@ fn seed(conn: &Connection) {
         [],
     )
     .unwrap();
+    // Name containing `q` so Find-a-fighter can type a query that would have
+    // quit under the old global `q` binding. Also present in the stub roster.
+    conn.execute(
+        "INSERT INTO fighters (fighter_id, name, stance) VALUES (6, 'Joaquin Buckley', 'Switch')",
+        [],
+    )
+    .unwrap();
 
     // One NUMBERED event (UFC 287) so the home poster headlines "UFC 287" and the
     // Browse-events path has a real card to open. The single fight lets the fight
@@ -336,6 +351,41 @@ fn seed(conn: &Connection) {
          ) VALUES (
             1, 1, 'UFC 287', '2023-04-08', 'Israel Adesanya', 'Alex Pereira',
             'Middleweight', 1, 'KO/TKO', 2, 264, 'Marc Goddard'
+         )",
+        [],
+    )
+    .unwrap();
+}
+
+/// Extra fixture used only by the upcoming-card predictor E2E. It leaves the
+/// default historical fixture alone so existing Browse-events tests still see
+/// their one seeded event.
+fn seed_upcoming_card(path: &PathBuf) {
+    let conn = Connection::open(path).expect("open temp db for upcoming card");
+    conn.execute(
+        "INSERT INTO events (event_id, title, date, location)
+         VALUES (2, 'UFC Future Night', '2099-01-10', 'Test City')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO fights (
+            fight_id, event_id, event_name, date, winner_name, loser_name,
+            weight_class, title_bout, method, round_ended, time_ended, referee
+         ) VALUES (
+            2, 2, 'UFC Future Night', '2099-01-10', 'Israel Adesanya', 'Robert Whittaker',
+            'Middleweight', 0, NULL, 0, 0, NULL
+         )",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO fights (
+            fight_id, event_id, event_name, date, winner_name, loser_name,
+            weight_class, title_bout, method, round_ended, time_ended, referee
+         ) VALUES (
+            3, 2, 'UFC Future Night', '2099-01-10', 'Alex Pereira', 'Robert Whittaker',
+            'Light Heavyweight', 0, NULL, 0, 0, NULL
          )",
         [],
     )
@@ -372,18 +422,23 @@ impl Session {
     /// the env overrides. Pass extra env pairs for the (single) real-stack test.
     fn spawn_stub() -> Session {
         let db = TempDb::new();
-        let env = vec![
-            ("MMA_DB".to_string(), db.path.display().to_string()),
-            (
-                "MMA_SIDECAR".to_string(),
-                fixtures_dir().join("stub_sidecar.py").display().to_string(),
-            ),
-            (
-                "MMA_SCRAPER".to_string(),
-                fixtures_dir().join("stub_scraper.sh").display().to_string(),
-            ),
-        ];
+        let env = stub_env(&db);
         Session::spawn_with(db, env)
+    }
+
+    /// Spawn the stub stack with one far-future event in the DB.
+    fn spawn_stub_with_upcoming_card() -> Session {
+        let db = TempDb::new();
+        seed_upcoming_card(&db.path);
+        let env = stub_env(&db);
+        Session::spawn_with(db, env)
+    }
+
+    /// Spawn the stub stack in a smaller `rows` x `cols` terminal.
+    fn spawn_stub_sized(rows: u16, cols: u16) -> Session {
+        let db = TempDb::new();
+        let env = stub_env(&db);
+        Session::spawn_sized(db, env, rows, cols)
     }
 
     /// Spawn the binary in a PTY with `env` applied on top of a clean base.
@@ -391,12 +446,17 @@ impl Session {
     /// `TERM=xterm-256color` and a fixed 45x140 size are always set so rendering
     /// is deterministic regardless of the (TTY-less) test runner environment.
     fn spawn_with(db: TempDb, env: Vec<(String, String)>) -> Session {
+        Session::spawn_sized(db, env, ROWS, COLS)
+    }
+
+    /// [`Session::spawn_with`] at an explicit `rows` x `cols` geometry.
+    fn spawn_sized(db: TempDb, env: Vec<(String, String)>, rows: u16, cols: u16) -> Session {
         let bin = mma_tui_bin();
 
         let pty = native_pty_system()
             .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -418,7 +478,7 @@ impl Session {
         let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
         let writer = pty.master.take_writer().expect("take pty writer");
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let eof = Arc::new(Mutex::new(false));
 
         // Reader thread: pump child output into the vt100 parser until EOF.
@@ -477,6 +537,24 @@ impl Session {
         self.wait_for_with_timeout(needle, POLL_TIMEOUT)
     }
 
+    /// Block until the rendered screen does NOT contain `needle`.
+    fn wait_until_absent(&self, needle: &str) -> String {
+        let start = Instant::now();
+        loop {
+            let screen = self.screen();
+            if !screen.contains(needle) {
+                return screen;
+            }
+            if start.elapsed() >= POLL_TIMEOUT {
+                panic!(
+                    "timed out after {:?} waiting for {needle:?} to disappear.\n--- last screen ---\n{screen}\n--- end ---",
+                    POLL_TIMEOUT
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn wait_for_with_timeout(&self, needle: &str, timeout: Duration) -> String {
         let start = Instant::now();
         loop {
@@ -524,6 +602,20 @@ impl Session {
     }
 }
 
+fn stub_env(db: &TempDb) -> Vec<(String, String)> {
+    vec![
+        ("MMA_DB".to_string(), db.path.display().to_string()),
+        (
+            "MMA_SIDECAR".to_string(),
+            fixtures_dir().join("stub_sidecar.py").display().to_string(),
+        ),
+        (
+            "MMA_SCRAPER".to_string(),
+            fixtures_dir().join("stub_scraper.sh").display().to_string(),
+        ),
+    ]
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         // Best-effort teardown so a failed assertion never leaves a stray child.
@@ -546,7 +638,12 @@ fn wait_home(s: &Session) -> String {
     s.wait_for("Predict");
     // The home footer is unique to the root menu (no "Esc Back" — you can't go
     // back from home), so it doubles as a "current screen == Home" assertion.
-    s.wait_for("↑↓ move · ⏎ select · q Quit")
+    s.wait_for("↑↓ move · ⏎ select · ^C quit")
+}
+
+/// Quit via Ctrl+C only.
+fn send_quit(s: &mut Session) {
+    s.send(CTRL_C);
 }
 
 /// The nav breadcrumb (the header's body line, e.g. "Home › Database › Find a
@@ -572,7 +669,7 @@ fn breadcrumb(screen: &str) -> String {
     // Root: find the framed line that strips to exactly "Home".
     screen
         .lines()
-        .map(|l| strip(l))
+        .map(strip)
         .find(|s| s == "Home")
         .unwrap_or_default()
 }
@@ -612,8 +709,8 @@ fn results_list_region(screen: &str) -> String {
 ///    poster that headlines the latest NUMBERED UFC card from the seeded DB
 ///    ("UFC 287"), and the vertical 4-option menu (Scrape / Database / Predict /
 ///    Model) is visible. The selection HIGHLIGHT moves with ↑/↓: the highlight
-///    glyph "▶ " starts on Scrape and lands on Database after one Down. Then q
-///    quits cleanly.
+///    glyph "▶ " starts on Scrape and lands on Database after one Down. Then
+///    Ctrl+C quits cleanly.
 #[test]
 fn intro_and_home_menu() {
     let mut s = Session::spawn_stub();
@@ -667,9 +764,12 @@ fn intro_and_home_menu() {
     s.send(UP);
     s.wait_for("▶ Scrape");
 
-    // Quit on Home with 'q' -> clean exit.
-    s.send("q");
-    assert!(s.wait_clean_exit(), "process should exit successfully on q");
+    // Quit on Home with Ctrl+C -> clean exit.
+    send_quit(&mut s);
+    assert!(
+        s.wait_clean_exit(),
+        "process should exit successfully on Ctrl+C"
+    );
 }
 
 /// 2. NAVIGATION (screen stack, no hotkey jumps): ⏎ on a menu PUSHES into a
@@ -740,15 +840,15 @@ fn navigation_push_pop_home() {
     s.send(ENTER); // into Find a fighter (deep)
     s.wait_for("Home › Database › Find a fighter");
     s.send(HOME);
-    let home = s.wait_for("↑↓ move · ⏎ select · q Quit");
+    let home = s.wait_for("↑↓ move · ⏎ select · ^C quit");
     assert_eq!(
         breadcrumb(&home),
         "Home",
         "the Home key should clear the stack back to the root menu:\n{home}"
     );
 
-    s.send("q");
-    assert!(s.wait_clean_exit(), "process should exit cleanly on q");
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit(), "process should exit cleanly on Ctrl+C");
 }
 
 /// 3a. DATABASE — "Find a fighter" path: Home -> Database -> Find a fighter ->
@@ -757,9 +857,9 @@ fn navigation_push_pop_home() {
 ///
 ///     Name-pool note (verified against app.rs::fighter_name_pool): the search
 ///     ranks over the SIDECAR roster when a model is loaded. The stub reports a
-///     loaded model, so the live list is the stub's three names — ["Alex Pereira",
-///     "Israel Adesanya", "Robert Whittaker"] — and "adesa" narrows to just
-///     Adesanya.
+///     loaded model, so the live list is the stub's four names — ["Alex Pereira",
+///     "Israel Adesanya", "Joaquin Buckley", "Robert Whittaker"] — and "adesa"
+///     narrows to just Adesanya.
 #[test]
 fn database_find_a_fighter_path() {
     let mut s = Session::spawn_stub();
@@ -774,15 +874,17 @@ fn database_find_a_fighter_path() {
     s.send(ENTER);
     s.wait_for("Search");
 
-    // With an empty query the full (sidecar) roster of 3 is listed.
+    // With an empty query the full (sidecar) roster of 4 is listed.
     let full = s.wait_for("Robert Whittaker");
     assert!(
-        full.contains("Israel Adesanya") && full.contains("Alex Pereira"),
-        "the unfiltered list should hold all 3 roster names:\n{full}"
+        full.contains("Israel Adesanya")
+            && full.contains("Alex Pereira")
+            && full.contains("Joaquin Buckley"),
+        "the unfiltered list should hold all 4 roster names:\n{full}"
     );
     assert!(
-        full.contains("Fighters (3)"),
-        "the unfiltered count should be 3:\n{full}"
+        full.contains("Fighters (4)"),
+        "the unfiltered count should be 4:\n{full}"
     );
 
     // Type a query that only matches Adesanya, then wait for the unambiguous
@@ -817,7 +919,40 @@ fn database_find_a_fighter_path() {
         "profile header should show a Record line:\n{screen}"
     );
 
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 3a2. DATABASE - typing `q` into Find a fighter searches (Joaquin Buckley)
+///      instead of quitting. Quit is Ctrl+C only.
+#[test]
+fn search_query_can_contain_q() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 1);
+    s.wait_for("Choose a path");
+    s.send(DOWN);
+    std::thread::sleep(Duration::from_millis(120));
+    s.send(ENTER);
+    s.wait_for("Search");
+    s.wait_for("Fighters (4)");
+
     s.send("q");
+    let narrowed = s.wait_for("Fighters (1)");
+    assert!(
+        narrowed.contains("Joaquin Buckley"),
+        "typing q should search for Joaquin Buckley, not quit:\n{narrowed}"
+    );
+    let list = results_list_region(&narrowed);
+    assert!(
+        !list.contains("Israel Adesanya")
+            && !list.contains("Alex Pereira")
+            && !list.contains("Robert Whittaker"),
+        "q should filter the other roster names OUT of the list:\n{list}"
+    );
+
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
@@ -865,7 +1000,7 @@ fn database_browse_events_path() {
         "the fight-card header should name the opened event:\n{card}"
     );
 
-    s.send("q");
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
@@ -886,6 +1021,7 @@ fn database_browse_events_path() {
 ///        is FILTERED OUT, proving the filter is real (not "all-but-A"). So the
 ///        single candidate at index 0 is "Robert Whittaker"; Enter commits B.
 ///      - With both slots committed, the sidecar prediction fires automatically.
+///
 ///    The stub returns prob_a 0.62 / prob_b 0.38 and a full tale-of-the-tape.
 #[test]
 fn predict_shows_probability_and_tale() {
@@ -923,6 +1059,25 @@ fn predict_shows_probability_and_tale() {
         "the Win probability pane should render:\n{screen}"
     );
 
+    // BOTH fighters get an "If X wins" card with their win % and their own
+    // method split (stub: A 30/28/4 of 62% -> 48/45/6%, B 20/15/3 of 38% ->
+    // 53/39/8%), each with a best-path callout carrying its overall share.
+    let cards = s.wait_for("If Robert Whittaker wins · 38%");
+    for want in [
+        "If Israel Adesanya wins · 62%",
+        "48%",
+        "45%",
+        "53%",
+        "39%",
+        "Best path: decision · 30% overall",
+        "Best path: decision · 20% overall",
+    ] {
+        assert!(
+            cards.contains(want),
+            "missing {want:?} in method cards:\n{cards}"
+        );
+    }
+
     // Tale-of-the-tape rows for both fighters (labels + a deterministic value).
     let tale = s.wait_for("Tale of the tape");
     assert!(
@@ -956,7 +1111,204 @@ fn predict_shows_probability_and_tale() {
         );
     }
 
-    s.send("q");
+    // Ctrl+Backspace clears both committed slots and the result in one action.
+    s.send(CTRL_BACKSPACE);
+    let cleared = s.wait_for("Choose two fighters");
+    assert!(
+        !cleared.contains("✓ Israel Adesanya") && !cleared.contains("✓ Robert Whittaker"),
+        "Ctrl+Backspace should drop both committed picks:\n{cleared}"
+    );
+    assert!(
+        !cleared.contains("62%"),
+        "Ctrl+Backspace should clear the prediction result:\n{cleared}"
+    );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4b. PREDICT on a short 80x30 terminal: the win split and BOTH fighters'
+///     method cards still render (the cards outrank the info box for space).
+#[test]
+fn predict_short_terminal_keeps_both_method_cards() {
+    let mut s = Session::spawn_stub_sized(30, 80);
+    wait_home(&s);
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Alex Pereira");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("✓ Israel Adesanya");
+    s.send(ENTER);
+
+    let screen = s.wait_for("If Robert Whittaker wins · 38%");
+    for want in [
+        "If Israel Adesanya wins · 62%",
+        "62% | 38%",
+        "Best path: decision · 30% overall",
+        "Best path: decision · 20% overall",
+    ] {
+        assert!(
+            screen.contains(want),
+            "missing {want:?} at 80x30:\n{screen}"
+        );
+    }
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4s. PREDICT - after both fighters are picked (query empty), typing `s`
+///     searches instead of opening the snapshot picker.
+#[test]
+fn predict_s_types_into_search_not_snapshot() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Fighter A");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("✓ Israel Adesanya");
+    s.send(ENTER);
+    s.wait_for("✓ Robert Whittaker");
+    s.wait_for("62%");
+
+    s.send("s");
+    let searched = s.wait_for("Matches (0)");
+    assert!(
+        !searched.contains("Current  (latest version)"),
+        "typing s after both picks must search, not open the snapshot picker:\n{searched}"
+    );
+    assert!(
+        searched.contains("✓ Israel Adesanya") && searched.contains("✓ Robert Whittaker"),
+        "typing s should leave the committed picks in place:\n{searched}"
+    );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4r. PREDICT - Ctrl+R opens the radar overlay for both committed fighters;
+///     Esc closes it and the prediction result is still there.
+#[test]
+fn predict_radar_overlay_two_fighters() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Fighter A");
+    s.send(DOWN);
+    s.send(ENTER);
+    s.wait_for("✓ Israel Adesanya");
+    s.send(ENTER);
+    s.wait_for("✓ Robert Whittaker");
+    s.wait_for("62%");
+
+    s.send(CTRL_R);
+    let radar = s.wait_for("Radar shape");
+    assert!(
+        radar.contains("Israel Adesanya") && radar.contains("Robert Whittaker"),
+        "radar title should name both fighters:\n{radar}"
+    );
+    for label in ["SLpM", "Acc", "Def", "TDd", "Sub"] {
+        assert!(
+            radar.contains(label),
+            "radar should show axis label {label}:\n{radar}"
+        );
+    }
+
+    s.send(ESC);
+    let back = s.wait_until_absent("Radar shape");
+    assert!(
+        back.contains("62%") && back.contains("Win probability"),
+        "Esc should return to the predict result:\n{back}"
+    );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4r2. FIND-A-FIGHTER - Ctrl+R opens radar for the highlighted fighter; Esc
+///      returns to the list. Opening the profile and Ctrl+R works there too.
+#[test]
+fn find_a_fighter_radar_overlay() {
+    let mut s = Session::spawn_stub();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 1);
+    s.wait_for("Choose a path");
+    s.send(DOWN);
+    std::thread::sleep(Duration::from_millis(120));
+    s.send(ENTER);
+    s.wait_for("Search");
+    s.send("adesa");
+    s.wait_for("Fighters (1)");
+    s.wait_for("Israel Adesanya");
+
+    s.send(CTRL_R);
+    let radar = s.wait_for("Radar shape");
+    assert!(
+        radar.contains("Israel Adesanya"),
+        "radar title should name the highlighted fighter:\n{radar}"
+    );
+    assert!(
+        radar.contains("SLpM") && radar.contains("TDd") && radar.contains("Sub"),
+        "radar should show axis labels:\n{radar}"
+    );
+
+    s.send(ESC);
+    s.wait_until_absent("Radar shape");
+    s.wait_for("Fighters (1)");
+
+    s.send(ENTER);
+    s.wait_for("Career stats");
+    s.send(CTRL_R);
+    let profile_radar = s.wait_for("Radar shape");
+    assert!(
+        profile_radar.contains("SLpM") && profile_radar.contains("TDd"),
+        "profile radar should show axis labels:\n{profile_radar}"
+    );
+
+    send_quit(&mut s);
+    assert!(s.wait_clean_exit());
+}
+
+/// 4a. PREDICT - UPCOMING CARD: with a future event present in the scraped DB,
+///     pressing Ctrl+U from the Predict screen predicts every fight on that next card.
+///     This exercises the user path end-to-end: DB lookup -> per-fight sidecar
+///     predictions -> card-level result pane.
+#[test]
+fn predict_upcoming_card_from_scraped_future_event() {
+    let mut s = Session::spawn_stub_with_upcoming_card();
+    wait_home(&s);
+
+    home_select_and_enter(&mut s, 2);
+    s.wait_for("Fighter A");
+
+    s.send(CTRL_U);
+    let card = s.wait_for("Upcoming card predictions");
+    assert!(
+        card.contains("UFC Future Night"),
+        "the upcoming-card pane should name the future event:\n{card}"
+    );
+    assert!(
+        card.contains("2099-01-10") && card.contains("Test City"),
+        "the upcoming-card pane should show date and location:\n{card}"
+    );
+
+    let results = s.wait_for("Predicted 2/2 fights");
+    assert!(
+        results.contains("Israel Adesanya")
+            && results.contains("Robert Whittaker")
+            && results.contains("Alex Pereira"),
+        "all scheduled fighters should appear in the card predictions:\n{results}"
+    );
+    assert!(
+        results.contains("62%") && results.contains("38%"),
+        "stub odds should render for card predictions:\n{results}"
+    );
+
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
@@ -968,7 +1320,7 @@ fn predict_shows_probability_and_tale() {
 ///
 ///     Stub membership (DIVISIONS): Pereira M#8 (Heavyweight); Adesanya + Whittaker
 ///     M#6 (Middleweight). So:
-///       * default "All weight classes" -> slot A lists all 3 (Matches (3)).
+///       * default "All weight classes" -> slot A lists all 4 (Matches (4)).
 ///       * ⇥ once -> "Middleweight" -> slot A lists Adesanya + Whittaker only
 ///         (Matches (2)); Pereira filtered OUT.
 ///       * ⇥ again -> "Heavyweight" -> slot A lists only Pereira (Matches (1));
@@ -992,14 +1344,15 @@ fn predict_weight_class_filters_candidate_pool() {
         "the class selector should list the fetched classes with member counts:\n{sel}"
     );
 
-    // Default "All weight classes": slot A's candidate list holds all 3 roster names.
-    let all = s.wait_for("Matches (3)");
+    // Default "All weight classes": slot A's candidate list holds all 4 roster names.
+    let all = s.wait_for("Matches (4)");
     let all_list = results_list_region(&all);
     assert!(
         all_list.contains("Alex Pereira")
             && all_list.contains("Israel Adesanya")
+            && all_list.contains("Joaquin Buckley")
             && all_list.contains("Robert Whittaker"),
-        "with All selected, slot A should list all 3 fighters:\n{all_list}"
+        "with All selected, slot A should list all 4 fighters:\n{all_list}"
     );
 
     // ⇥ once -> Middleweight. Slot A narrows to the two Middleweights; Pereira is
@@ -1033,7 +1386,7 @@ fn predict_weight_class_filters_candidate_pool() {
         "Heavyweight must filter the Middleweights OUT of slot A:\n{hw_list}"
     );
 
-    s.send("q");
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
@@ -1084,13 +1437,13 @@ fn predict_weight_class_composes_with_eligibility() {
         );
     }
 
-    s.send("q");
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
-/// 5. SCRAPE — chips + NO-FREEZE + animation + streaming + completion.
+/// 5. SCRAPE - chips + NO-FREEZE + spinner + streaming + completion.
 ///
-///    Home -> Scrape; assert the "Full: OFF" chip, press f and assert it flips to
+///    Home -> Scrape; assert the "Full: OFF" chip, press Ctrl+F and assert it flips to
 ///    "Full: ON" INSTANTLY; press Enter to run the (stub) scraper. WHILE it runs
 ///    we prove the UI is NOT frozen: the loading overlay's braille SPINNER glyph
 ///    advances between two timed captures AND the streamed log/progress arrives
@@ -1113,15 +1466,15 @@ fn scrape_chips_no_freeze_and_streams() {
         "the Full chip should start OFF:\n{opts}"
     );
 
-    // 'f' flips the chip to ON instantly (chip is re-rendered the next frame).
-    s.send("f");
+    // Ctrl+F flips the chip to ON instantly (chip is re-rendered the next frame).
+    s.send(CTRL_F);
     let on = s.wait_for("Full: ON");
     assert!(
         on.contains("Full: ON"),
-        "pressing f should flip the chip to Full: ON:\n{on}"
+        "pressing Ctrl+F should flip the chip to Full: ON:\n{on}"
     );
     // Flip it back OFF so the next run is the cheap incremental scrape.
-    s.send("f");
+    s.send(CTRL_F);
     s.wait_for("Full: OFF");
 
     // RUN: Enter launches the async job + the loading overlay.
@@ -1129,10 +1482,10 @@ fn scrape_chips_no_freeze_and_streams() {
 
     // The overlay is up: the spinner panel reports the job is "running" and the
     // overlay footer switches to the running-job hint (proof the job started and
-    // the body was replaced by the loading animation).
+    // the body was replaced by the loading overlay).
     let running = s.wait_for("running");
     assert!(
-        running.contains("running… · q Quit"),
+        running.contains("running… · ^C quit"),
         "the footer should show the running-job hint while the scrape runs:\n{running}"
     );
 
@@ -1199,7 +1552,7 @@ fn scrape_chips_no_freeze_and_streams() {
     s.send(ENTER);
     s.wait_for("Scraper options");
 
-    s.send("q");
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
@@ -1265,7 +1618,7 @@ fn progress_bar_stops_and_shows_done_on_completion() {
     s.send(ENTER);
     s.wait_for("Scraper options");
 
-    s.send("q");
+    send_quit(&mut s);
     assert!(s.wait_clean_exit());
 }
 
@@ -1371,7 +1724,10 @@ fn overlay_spinner(screen: &str) -> String {
 fn real_stack_smoke() {
     let venv_python = repo_root().join(".venv").join("bin").join("python");
     let real_db = repo_root().join("data").join("ufc.db");
-    let real_model = repo_root().join("ml").join("models").join("predictor.joblib");
+    let real_model = repo_root()
+        .join("ml")
+        .join("models")
+        .join("predictor.joblib");
 
     // Skip gracefully if the real stack is not provisioned on this machine.
     if !venv_python.is_file() || !real_db.is_file() || !real_model.is_file() {
@@ -1445,14 +1801,35 @@ fn real_stack_smoke() {
     // quits — exercising the screen-stack nav against the real stack too.
     s.send(ESC);
     s.send(HOME);
-    s.wait_for("↑↓ move · ⏎ select · q Quit");
+    s.wait_for("↑↓ move · ⏎ select · ^C quit");
     s.send(CTRL_C);
-    assert!(s.wait_clean_exit(), "real-stack session should exit cleanly");
+    assert!(
+        s.wait_clean_exit(),
+        "real-stack session should exit cleanly"
+    );
 }
 
 // Reference the rarely-used key constants so `-D unused` stays quiet even if a
 // future edit removes their only use; keeps the encoding table self-documenting.
 #[allow(dead_code)]
 fn _key_table_is_referenced() {
-    let _ = (LEFT, RIGHT, TAB, UP, ESC, ENTER, CTRL_C, BACKSPACE, HOME);
+    let _ = (
+        LEFT,
+        RIGHT,
+        TAB,
+        UP,
+        ESC,
+        ENTER,
+        CTRL_C,
+        CTRL_R,
+        CTRL_P,
+        CTRL_S,
+        CTRL_U,
+        CTRL_F,
+        CTRL_T,
+        CTRL_L,
+        CTRL_BACKSPACE,
+        BACKSPACE,
+        HOME,
+    );
 }

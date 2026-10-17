@@ -591,7 +591,10 @@ mod tests {
         let otel = ChildOtel::scraper_with(&cfg.repo_root, &ProcessOtelEnv::default(), false);
         otel.apply(&mut cmd);
         let envs = command_env(&cmd);
-        assert_eq!(envs.get("OTEL_SERVICE_NAME").map(String::as_str), Some("mma-scraper"));
+        assert_eq!(
+            envs.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some("mma-scraper")
+        );
         assert_eq!(envs.get("MMA_OTEL").map(String::as_str), Some("1"));
         assert_eq!(
             envs.get("MMA_OTEL_FILE").map(String::as_str),
@@ -603,7 +606,7 @@ mod tests {
 
     #[test]
     fn scrape_command_sets_otlp_endpoint_when_collector_reachable() {
-        use crate::otel::{ChildOtel, ProcessOtelEnv, DEFAULT_OTLP_ENDPOINT};
+        use crate::otel::{ChildOtel, DEFAULT_OTLP_ENDPOINT, ProcessOtelEnv};
 
         let cfg = Config::resolve(
             std::path::PathBuf::from("/tmp/repo"),

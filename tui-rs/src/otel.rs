@@ -231,7 +231,10 @@ mod tests {
         let root = PathBuf::from("/tmp/repo");
         let otel = ChildOtel::scraper_with(&root, &default_env(), false);
         let vars = vars_map(&otel);
-        assert_eq!(vars.get("OTEL_SERVICE_NAME").map(String::as_str), Some(SERVICE_SCRAPER));
+        assert_eq!(
+            vars.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some(SERVICE_SCRAPER)
+        );
         assert_eq!(vars.get("MMA_OTEL").map(String::as_str), Some("1"));
         assert_eq!(
             vars.get("MMA_OTEL_FILE").map(String::as_str),
@@ -317,7 +320,10 @@ mod tests {
     fn sidecar_plan_uses_ml_service_and_file() {
         let otel = ChildOtel::sidecar_with(&PathBuf::from("/tmp/repo"), &default_env(), true);
         let vars = vars_map(&otel);
-        assert_eq!(vars.get("OTEL_SERVICE_NAME").map(String::as_str), Some(SERVICE_SIDECAR));
+        assert_eq!(
+            vars.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some(SERVICE_SIDECAR)
+        );
         assert_eq!(
             vars.get("MMA_OTEL_FILE").map(String::as_str),
             Some("/tmp/repo/telemetry/runs/tui-ml.jsonl")
@@ -343,7 +349,10 @@ mod tests {
                 ))
             })
             .collect();
-        assert_eq!(envs.get("OTEL_SERVICE_NAME").map(String::as_str), Some("mma-scraper"));
+        assert_eq!(
+            envs.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some("mma-scraper")
+        );
         assert_eq!(envs.get("MMA_OTEL").map(String::as_str), Some("1"));
         assert_eq!(
             envs.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),

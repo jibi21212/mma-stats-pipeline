@@ -29,9 +29,15 @@ Every request has an integer `id` and a string `cmd`:
 {"id":N,"cmd":"ping"}
 {"id":N,"cmd":"status"}
 {"id":N,"cmd":"roster"}
-{"id":N,"cmd":"predict","a":"<name>","b":"<name>"}
+{"id":N,"cmd":"predict","a":"<name>","b":"<name>","snap_a":<sel>,"snap_b":<sel>}
+{"id":N,"cmd":"timeline","name":"<name>"}
 {"id":N,"cmd":"reload"}
 ```
+
+A snapshot `<sel>` (both `snap_a`/`snap_b` are **optional**) picks which career
+snapshot of a fighter to use: omitted/`null`/`"current"` (default = latest
+version), `"prime"`, `{"fight_id":<int>}`, or `{"date":"YYYY-MM-DD"}`. Omitting
+them yields the **byte-identical** old predict request.
 
 ### Responses (sidecar → Rust)
 Echo the same `id`:
@@ -48,13 +54,24 @@ error: {"id":N,"ok":false,"error":"<message>"}
 | `status`  | `model_loaded:bool`, `n_fighters:int`, `metrics:{...}\|null`, `model_path:str`   |
 | `roster`  | `fighters:[str,...]`  (→ `ok:false "model not trained"` if no model)             |
 | `predict` | `result:{...}` — the `predict()` dict with **NaN/Inf replaced by null**          |
+| `timeline`| `name:str`, `snapshots:[{...}, ...]` — a fighter's selectable career snapshots   |
 | `reload`  | `model_loaded:bool`, `n_fighters:int`                                            |
 
 `predict.result` mirrors `ml/predict.py::predict()`:
 `name_a, name_b, allowed, reason, prob_a, prob_b, low_confidence, distance,
-tale_a, tale_b, model, test_accuracy`. Each `tale_*` has:
+tale_a, tale_b, model, test_accuracy`, plus `snap_a_label`/`snap_b_label` (which
+snapshot each side used, e.g. `"current"` / `"prime (2021-03-06)"`) and
+`method_probs` — a coherent **joint** win-method distribution
+`{"a":{decision,ko_tko,submission},"b":{...},"a_given_win":{...},"b_given_win":{...},"kappa":f}`
+(or `null` on a legacy payload), where the six `a`/`b` values sum to 1 and
+`a_given_win`/`b_given_win` are each fighter's conditional split
+`P(method | that fighter wins)` (each sums to 1; absent on an older sidecar). Each `tale_*` has:
 `elo, age, record (str "W-L"), reach_in, height_in, stance, recent_winrate,
 form_delta, layoff_days, divisions (list)`.
+
+`timeline.snapshots` items (oldest first, the computed prime flagged):
+`index, fight_id, date, opponent, result ("w"/"l"), weight_class, record (str
+"W-L"), elo, win_streak, is_prime`.
 
 **JSON `null` rule:** any Python `NaN`/`Inf` (missing reach/height/age/elo) MUST be
 serialized as JSON `null` so the Rust `Option<f64>` fields deserialize cleanly.
@@ -96,12 +113,28 @@ dates/DOB ISO `YYYY-MM-DD` text; missing numerics are NULL → `Option::None`.
 - `struct PredictResult` — `name_a, name_b: String; allowed: bool;
   reason: Option<String>; prob_a, prob_b: Option<f64>; low_confidence: bool;
   distance: Option<i64>; tale_a, tale_b: Option<TaleOfTape>;
-  model: Option<String>; test_accuracy: Option<f64>`.
+  model: Option<String>; test_accuracy: Option<f64>`, plus (all `#[serde(default)]`
+  so an older sidecar still deserializes) `snap_a_label, snap_b_label: Option<String>`
+  and `method_probs: Option<MethodSplit>`.
+- `struct MethodProbs` — `decision, ko_tko, submission: Option<f64>`.
+- `struct MethodSplit` — `a: MethodProbs, b: MethodProbs, kappa: Option<f64>` (the
+  six `a`/`b` values are a coherent joint distribution summing to 1), plus
+  `#[serde(default)] a_given_win, b_given_win: Option<MethodProbs>` (each fighter's
+  conditional "if they win" split, summing to 1; `None` from an older sidecar).
+- `enum SnapSelector` (`#[serde(untagged)]`) — `Anchor(String)` (`"current"`/
+  `"latest"`/`"prime"`), `Fight { fight_id: i64 }`, or `Date { date: String }`.
+- `struct SnapshotMeta` — `index: i64, fight_id: Option<i64>, date: String,
+  opponent: String, result: String, weight_class: Option<String>, record: String,
+  elo: Option<f64>, win_streak: i64, is_prime: bool`.
+- `struct TimelinePayload` — `name: String, snapshots: Vec<SnapshotMeta>`.
 
 ### IPC types
 - `struct SidecarRequest { id: u64, #[serde(flatten)] cmd: SidecarCommand }`.
 - `enum SidecarCommand` — `#[serde(tag = "cmd", rename_all = "lowercase")]`:
-  `Ping, Status, Roster, Predict { a: String, b: String }, Reload`.
+  `Ping, Status, Roster, Eligibility,
+  Predict { a, b: String, snap_a, snap_b: Option<SnapSelector> (both
+  #[serde(default, skip_serializing_if = "Option::is_none")]) },
+  Timeline { name: String }, Reload`.
 - `struct SidecarResponse { id: u64, ok: bool, error: Option<String>,
   #[serde(flatten)] payload: serde_json::Value }`.
 - Typed payloads (deserialize `payload` into these per command):
@@ -153,7 +186,10 @@ impl Sidecar {
     pub fn ping(&mut self) -> Result<()>;
     pub fn status(&mut self) -> Result<StatusPayload>;
     pub fn roster(&mut self) -> Result<Vec<String>>;
-    pub fn predict(&mut self, a: &str, b: &str) -> Result<PredictResult>;
+    pub fn predict(&mut self, a: &str, b: &str,
+                   snap_a: Option<SnapSelector>, snap_b: Option<SnapSelector>)
+                   -> Result<PredictResult>;
+    pub fn timeline(&mut self, name: &str) -> Result<Vec<SnapshotMeta>>;
     pub fn reload(&mut self) -> Result<ReloadPayload>;
 }
 impl Drop for Sidecar { /* kills the child */ }

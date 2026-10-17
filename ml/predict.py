@@ -60,6 +60,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 import db  # noqa: E402  (local module; path set above)
+import telemetry  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Paths / constants
@@ -83,6 +84,29 @@ DEBUT_LAYOFF_DAYS = 365.0
 #: The scraper fills winner_name even for draws/NCs (document-order fallback),
 #: so we drop any fight whose method indicates a draw / no-contest / overturn.
 _NO_WINNER_TOKENS = ("draw", "nc", "no contest", "overturn")
+
+# --------------------------------------------------------------------------- #
+# Prime-snapshot + method-of-victory parameters
+# --------------------------------------------------------------------------- #
+#
+# These are READABILITY choices (like the clustering k in archetypes.py), not
+# data-derived constants — exposed here so they can be tuned in one place.
+
+#: A fighter's "prime" is the pre-fight snapshot that maximises a blend of
+#: career-relative smoothed Elo (skill, already opponent-weighted) and active
+#: win streak (the "on a hot run" intuition).
+PRIME_MIN_FIGHTS = 3        #: ignore a fighter's first N fights when picking a prime
+PRIME_SMOOTH_WINDOW = 3     #: centred rolling mean of elo_pre (defeats 1-fight spikes)
+PRIME_W_ELO = 0.6           #: weight on career-relative smoothed Elo
+PRIME_W_STREAK = 0.4        #: weight on the active win streak
+PRIME_STREAK_CAP = 5        #: a win streak this long maxes the streak component
+
+#: Method-of-victory classes. Every decisive fight is mapped to exactly one of
+#: these; draws / NC / DQ / overturns map to None and carry no method.
+METHOD_CLASSES = ("decision", "ko_tko", "submission")
+#: Empirical-Bayes shrinkage strength: how many fights of league-average belief
+#: to blend in before a fighter's own method mix dominates.
+METHOD_PRIOR_KAPPA = 6.0
 
 
 # --------------------------------------------------------------------------- #
@@ -445,6 +469,29 @@ def _clean_label_fights(fights: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _method_class(method) -> Optional[str]:
+    """Collapse a raw ``fights.method`` string to one of ``METHOD_CLASSES``.
+
+    Returns ``"decision"`` / ``"ko_tko"`` / ``"submission"``, or ``None`` for
+    draws / no-contests / overturns / DQ / "Other" (no clean finishing method).
+    "decision" is checked first; ``"ko"``/``"tko"`` catch "KO/TKO" and
+    "TKO - Doctor's Stoppage"; this matches the decision-vs-finish convention in
+    ``db._compute_finish_rate``.
+    """
+    if method is None:
+        return None
+    s = str(method).strip().lower()
+    if not s:
+        return None
+    if "decision" in s:
+        return "decision"
+    if "tko" in s or "ko" in s:        # "KO/TKO", "TKO - Doctor's Stoppage"
+        return "ko_tko"
+    if "submission" in s or "sub" in s:
+        return "submission"
+    return None
+
+
 def build_training_frame(
     fighters: pd.DataFrame,
     fights: pd.DataFrame,
@@ -453,7 +500,7 @@ def build_training_frame(
 
     Returns
     -------
-    (X, y, dates, snapshots, divisions, static)
+    (X, y, dates, snapshots, divisions, static, timeline_artifacts, method_artifacts)
         * ``X``         : DataFrame of FEATURE_COLUMNS (2 rows per fight).
         * ``y``         : Series of 0/1 labels aligned to X.
         * ``dates``     : Series of fight dates aligned to X (for temporal split).
@@ -463,6 +510,11 @@ def build_training_frame(
         * ``divisions`` : dict name -> set of (gender, ordinal) divisions fought.
         * ``static``    : dict name -> dict of static attrs (reach/height/
                           southpaw/age-now/record) for the tale of the tape.
+        * ``timeline_artifacts`` : dict with ``timeline`` (name -> chronological
+                          list of pre-fight snapshot entries), ``prime_index``,
+                          ``prime_low_confidence`` and ``fight_index`` lookups.
+        * ``method_artifacts``   : dict with the method-of-victory ``base_rate``,
+                          ``kappa`` and held-out ``metrics``.
 
     LEAKAGE GUARANTEE: for each fight we read each fighter's running state
     (Elo, counts, recent results, last-fight date, Elo history) as it stood
@@ -509,6 +561,10 @@ def build_training_frame(
                 "last_date": None,   # date of previous fight
                 "dates": [],         # all prior fight dates (chronological)
                 "divisions": set(),  # (gender, ordinal) fought in
+                # Method-of-victory counters (prior fights only). Offensive =
+                # how this fighter has WON; defensive = how they have LOST.
+                "w_decision": 0, "w_ko_tko": 0, "w_submission": 0,
+                "l_decision": 0, "l_ko_tko": 0, "l_submission": 0,
             }
             state[name] = st
         return st
@@ -558,6 +614,14 @@ def build_training_frame(
         else:
             fights_last_365 = 0
 
+        # Active win streak going INTO this fight = trailing 1s in prior results.
+        win_streak = 0
+        for r in reversed(st["results"]):
+            if r == 1:
+                win_streak += 1
+            else:
+                break
+
         return {
             "elo_pre": float(elo_pre),
             "elo_momentum": float(elo_momentum),
@@ -573,21 +637,69 @@ def build_training_frame(
             "southpaw": float(stat["southpaw"]),
             "is_debut": float(is_debut),
             "stance": stat["stance"],
+            "win_streak": int(win_streak),
+            # Method-of-victory counters as of this snapshot (prior fights only).
+            # NOT features (absent from DIFF_FEATURES); used by method_split().
+            "w_decision": int(st["w_decision"]), "w_ko_tko": int(st["w_ko_tko"]),
+            "w_submission": int(st["w_submission"]),
+            "l_decision": int(st["l_decision"]), "l_ko_tko": int(st["l_ko_tko"]),
+            "l_submission": int(st["l_submission"]),
         }
 
     rows = []
     labels = []
     dates = []
+    timeline = {}        # name -> chronological list of pre-fight snapshot entries
+    fight_index = {}     # name -> {fight_id: position in that fighter's timeline}
+    method_eval = []     # (off_counts, def_counts, method_class, is_test) per fight
+    cutoff_ts = pd.Timestamp(TEST_CUTOFF)
+
+    def _append_entry(name, snap, opponent, result_char, weight_class_str, fid, fight_date):
+        """Record this fighter's pre-fight snapshot into their timeline.
+
+        Called AFTER ``snapshot()`` and BEFORE the state mutation, so every value
+        captured here reflects strictly-prior fights (same guarantee as the
+        training row). ``record_pre`` and ``divisions_as_of`` read the pre-update
+        running state.
+        """
+        st = get_state(name)
+        wins_pre = int(st["wins"])
+        losses_pre = int(st["n"] - st["wins"])
+        fid_int = int(fid) if fid is not None and not pd.isna(fid) else None
+        entry = {
+            "fight_id": fid_int,
+            "date": fight_date,
+            "opponent": opponent,
+            "result": result_char,
+            "weight_class": weight_class_str,
+            "elo": float(snap["elo_pre"]),
+            "n_prior_fights": int(snap["n_prior_fights"]),
+            "win_streak": int(snap["win_streak"]),
+            "record_pre": [wins_pre, losses_pre],
+            "divisions_as_of": set(st["divisions"]),
+            "snap": snap,
+        }
+        tl = timeline.setdefault(name, [])
+        if fid_int is not None:
+            fight_index.setdefault(name, {})[fid_int] = len(tl)
+        tl.append(entry)
 
     for _, fight in flabel.iterrows():
         w = fight["winner_name"]
         l = fight["loser_name"]
         fight_date = fight["date"]
-        div = normalize_weight_class(fight.get("weight_class"))
+        wc = fight.get("weight_class")
+        fid = fight.get("fight_id")
+        div = normalize_weight_class(wc)
         title_bout = 1.0 if pd.to_numeric(fight.get("title_bout"), errors="coerce") == 1 else 0.0
+        mc = _method_class(fight.get("method"))
 
         snap_w = snapshot(w, fight_date)
         snap_l = snapshot(l, fight_date)
+
+        # Capture per-fighter timeline entries (pre-update => leakage-safe).
+        _append_entry(w, snap_w, l, "w", wc, fid, fight_date)
+        _append_entry(l, snap_l, w, "l", wc, fid, fight_date)
 
         # stance mismatch: orthodox-vs-southpaw indicator (symmetric).
         stance_mismatch = 1.0 if snap_w["southpaw"] != snap_l["southpaw"] else 0.0
@@ -601,6 +713,16 @@ def build_training_frame(
         rows.append(_diff_row(snap_l, snap_w, stance_mismatch, title_bout))
         labels.append(0)
         dates.append(fight_date)
+
+        # Method-of-victory: record an as-of held-out grading sample (the winner's
+        # offensive method mix vs the loser's defensive mix, both PRE this fight).
+        if mc is not None:
+            method_eval.append((
+                [snap_w["w_decision"], snap_w["w_ko_tko"], snap_w["w_submission"]],
+                [snap_l["l_decision"], snap_l["l_ko_tko"], snap_l["l_submission"]],
+                mc,
+                bool(fight_date >= cutoff_ts),
+            ))
 
         # --- NOW update running state with this fight's outcome ----------- #
         e_w = _expected_score(get_state(w)["elo"], get_state(l)["elo"])
@@ -623,6 +745,10 @@ def build_training_frame(
         if div is not None:
             sw["divisions"].add(div)
             sl["divisions"].add(div)
+        # Method counters: winner's offensive + loser's defensive for this class.
+        if mc is not None:
+            sw[f"w_{mc}"] += 1
+            sl[f"l_{mc}"] += 1
 
     X = pd.DataFrame(rows, columns=FEATURE_COLUMNS)
     y = pd.Series(labels, name="label")
@@ -657,7 +783,33 @@ def build_training_frame(
             "winrate_prior": snap["winrate_prior"],
         }
 
-    return X, y, dates, snapshots, divisions, static
+    # --- "Prime" snapshot index per fighter (Elo + win-streak blend) -------- #
+    prime_index = {}
+    prime_low_confidence = {}
+    for nm, entries in timeline.items():
+        idx, low_conf = _pick_prime(entries)
+        prime_index[nm] = idx
+        prime_low_confidence[nm] = low_conf
+
+    # --- Method-of-victory base rate (TRAIN-split decisive fights only) ----- #
+    method_base_rate = _method_base_rate(flabel, cutoff_ts)
+    # Held-out grade of the method heuristic (honest, not asserted).
+    method_metrics = _grade_method_split(method_eval, method_base_rate, METHOD_PRIOR_KAPPA)
+
+    timeline_artifacts = {
+        "timeline": timeline,
+        "prime_index": prime_index,
+        "prime_low_confidence": prime_low_confidence,
+        "fight_index": fight_index,
+    }
+    method_artifacts = {
+        "base_rate": method_base_rate,
+        "kappa": METHOD_PRIOR_KAPPA,
+        "metrics": method_metrics,
+    }
+
+    return (X, y, dates, snapshots, divisions, static,
+            timeline_artifacts, method_artifacts)
 
 
 def _diff_row(snap_a, snap_b, stance_mismatch, title_bout):
@@ -673,6 +825,243 @@ def _diff_row(snap_a, snap_b, stance_mismatch, title_bout):
     row.append(stance_mismatch)
     row.append(title_bout)
     return row
+
+
+# --------------------------------------------------------------------------- #
+# 2b) PRIME SELECTION + METHOD-OF-VICTORY SPLIT
+# --------------------------------------------------------------------------- #
+
+def _pick_prime(entries):
+    """Index of a fighter's "prime" fight in their chronological timeline.
+
+    Prime = argmax over QUALIFYING pre-fight snapshots (>= ``PRIME_MIN_FIGHTS``
+    prior fights) of a blend of career-relative SMOOTHED Elo and active win
+    streak::
+
+        score_i = PRIME_W_ELO * elo_norm_i + PRIME_W_STREAK * streak_norm_i
+
+    ``elo_norm`` normalises a centred ``PRIME_SMOOTH_WINDOW`` rolling mean of
+    ``elo_pre`` to the fighter's OWN [min, max] (we want their peak, not a league
+    peak); the smoothing stops a single upset spike from being read as a prime.
+    ``streak_norm = min(win_streak, PRIME_STREAK_CAP) / PRIME_STREAK_CAP``.
+    Earliest index wins ties (career ascendancy). If nothing qualifies, fall back
+    to the raw Elo peak and flag low confidence.
+
+    Returns ``(index, low_confidence)``.
+    """
+    n = len(entries)
+    if n == 0:
+        return 0, True
+
+    elos = [e["elo"] for e in entries]
+    half = PRIME_SMOOTH_WINDOW // 2
+    smooth = []
+    for i in range(n):
+        window = elos[max(0, i - half):min(n, i + half + 1)]
+        smooth.append(sum(window) / len(window))
+
+    qualifying = [i for i, e in enumerate(entries)
+                  if e["n_prior_fights"] >= PRIME_MIN_FIGHTS]
+    low_confidence = False
+    if not qualifying:                       # career too short for the gate
+        low_confidence = True
+        qualifying = list(range(n))
+
+    qs = [smooth[i] for i in qualifying]
+    smin, smax = min(qs), max(qs)
+    span = smax - smin
+
+    best_idx, best_score = qualifying[0], None
+    for i in qualifying:
+        elo_norm = 1.0 if span == 0 else (smooth[i] - smin) / span
+        streak_norm = min(entries[i]["win_streak"], PRIME_STREAK_CAP) / float(PRIME_STREAK_CAP)
+        score = PRIME_W_ELO * elo_norm + PRIME_W_STREAK * streak_norm
+        if best_score is None or score > best_score:   # strict > -> earliest tie wins
+            best_idx, best_score = i, score
+    return best_idx, low_confidence
+
+
+def _method_base_rate(flabel, cutoff_ts):
+    """League method base rate over ``METHOD_CLASSES`` from TRAIN-split fights.
+
+    Floored away from zero and renormalised so every class has positive mass (the
+    empirical-Bayes prior and the tilt combiner must never divide by zero).
+    """
+    counts = {c: 0 for c in METHOD_CLASSES}
+    if "method" in flabel.columns:
+        for date, method in zip(flabel["date"], flabel["method"]):
+            if pd.notna(date) and date >= cutoff_ts:
+                continue
+            mc = _method_class(method)
+            if mc is not None:
+                counts[mc] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return {c: 1.0 / len(METHOD_CLASSES) for c in METHOD_CLASSES}
+    eps = 1e-3
+    raw = {c: counts[c] / total + eps for c in METHOD_CLASSES}
+    s = sum(raw.values())
+    return {c: raw[c] / s for c in METHOD_CLASSES}
+
+
+def _conditional_method_dist(off_counts, def_counts, base_rate, kappa):
+    """P(method | this fighter wins) via an empirical-Bayes two-tilt blend.
+
+    Shrink the fighter's offensive method mix and the opponent's defensive
+    (got-finished) mix toward ``base_rate`` with strength ``kappa``, multiply the
+    two tilts divided by the base rate, and renormalise. With no personal data
+    both tilts equal the base rate, so the result IS the base rate (unbiased).
+    """
+    br = [base_rate[c] for c in METHOD_CLASSES]
+    off_total = sum(off_counts)
+    def_total = sum(def_counts)
+    tilt = []
+    for j in range(len(METHOD_CLASSES)):
+        off = (off_counts[j] + kappa * br[j]) / (off_total + kappa)
+        dfn = (def_counts[j] + kappa * br[j]) / (def_total + kappa)
+        tilt.append(off * dfn / br[j])
+    s = sum(tilt)
+    if s <= 0:
+        return {c: br[j] for j, c in enumerate(METHOD_CLASSES)}
+    return {c: tilt[j] / s for j, c in enumerate(METHOD_CLASSES)}
+
+
+def _grade_method_split(method_eval, base_rate, kappa):
+    """Held-out multiclass log-loss of the method heuristic vs a base-rate baseline.
+
+    Each record is ``(winner_offensive_counts, loser_defensive_counts, method
+    class, is_test)``. Grades only the as-of-date conditional method model (no
+    win-model probabilities needed) -> an honest, leakage-safe sanity check.
+    """
+    eps = 1e-12
+    model_ll, base_ll, n = 0.0, 0.0, 0
+    for off, dfn, mc, is_test in method_eval:
+        if not is_test:
+            continue
+        q = _conditional_method_dist(off, dfn, base_rate, kappa)
+        model_ll += -np.log(max(q.get(mc, 0.0), eps))
+        base_ll += -np.log(max(base_rate.get(mc, 0.0), eps))
+        n += 1
+    if n == 0:
+        return {"n_test": 0, "log_loss": None, "baseline_log_loss": None}
+    return {
+        "n_test": int(n),
+        "log_loss": float(model_ll / n),
+        "baseline_log_loss": float(base_ll / n),
+    }
+
+
+def method_split(snap_a, snap_b, prob_a, prob_b, base_rate, kappa=METHOD_PRIOR_KAPPA):
+    """Coherent JOINT win-method distribution for a matchup.
+
+    Composes ``P(win) x P(method | win)`` for each fighter, where the conditional
+    blends THAT fighter's offensive method mix with the OPPONENT's defensive mix.
+    The six returned probabilities sum to ``prob_a + prob_b == 1``.
+    ``a_given_win`` / ``b_given_win`` are the per-fighter conditionals
+    ``P(method | that fighter wins)`` (each sums to 1), so a UI can show how the
+    underdog wins on the same footing as the favourite.
+    Returns ``{"a": {decision, ko_tko, submission}, "b": {...},
+    "a_given_win": {...}, "b_given_win": {...}, "kappa": float}``.
+    """
+    off_a = [snap_a.get("w_decision", 0), snap_a.get("w_ko_tko", 0), snap_a.get("w_submission", 0)]
+    def_a = [snap_a.get("l_decision", 0), snap_a.get("l_ko_tko", 0), snap_a.get("l_submission", 0)]
+    off_b = [snap_b.get("w_decision", 0), snap_b.get("w_ko_tko", 0), snap_b.get("w_submission", 0)]
+    def_b = [snap_b.get("l_decision", 0), snap_b.get("l_ko_tko", 0), snap_b.get("l_submission", 0)]
+    q_a = _conditional_method_dist(off_a, def_b, base_rate, kappa)  # A wins: A offense vs B defense
+    q_b = _conditional_method_dist(off_b, def_a, base_rate, kappa)  # B wins: B offense vs A defense
+    return {
+        "a": {c: float(prob_a * q_a[c]) for c in METHOD_CLASSES},
+        "b": {c: float(prob_b * q_b[c]) for c in METHOD_CLASSES},
+        "a_given_win": {c: float(q_a[c]) for c in METHOD_CLASSES},
+        "b_given_win": {c: float(q_b[c]) for c in METHOD_CLASSES},
+        "kappa": float(kappa),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 2c) SNAPSHOT RESOLUTION (current / prime / as-of a specific fight)
+# --------------------------------------------------------------------------- #
+
+def _static_from_entry(entry):
+    """Reconstruct a tale-of-the-tape 'static' dict from a timeline entry."""
+    snap = entry["snap"]
+    wins, losses = entry["record_pre"]
+    return {
+        "elo": float(entry["elo"]),
+        "age_years": snap.get("age_years"),
+        "wins": int(wins),
+        "losses": int(losses),
+        "n_fights": int(entry["n_prior_fights"]),
+        "reach_in": snap.get("reach_in"),
+        "height_in": snap.get("height_in"),
+        "stance": snap.get("stance"),
+        "southpaw": snap.get("southpaw"),
+        "recent_winrate": snap.get("recent_winrate"),
+        "form_delta": snap.get("form_delta"),
+        "days_since_last": snap.get("days_since_last"),
+        "winrate_prior": snap.get("winrate_prior"),
+    }
+
+
+def _resolve_snapshot(payload, name, selector):
+    """Resolve a snapshot ``selector`` for ``name`` to what predict() needs.
+
+    ``selector``:
+      * ``None`` / ``"current"`` / ``"latest"`` -> the fighter's CURRENT snapshot
+        (default; byte-identical to the pre-feature behaviour).
+      * ``"prime"``                -> their prime fight snapshot.
+      * ``{"fight_id": int}``      -> the snapshot as of that specific fight.
+      * ``{"date": "YYYY-MM-DD"}`` -> the most recent snapshot on/before a date.
+
+    Returns ``(snap, divisions_set, tale_static, label, low_confidence)``.
+    Raises ``ValueError`` for an unresolvable historical selector (legacy payload
+    with no timeline, unknown fight_id, etc.).
+    """
+    snaps = payload["snapshots"]
+    if name not in snaps:
+        raise ValueError(f"unknown fighter: {name}")
+
+    if selector is None or selector in ("current", "latest"):
+        return (snaps[name], payload.get("divisions", {}).get(name, set()),
+                payload.get("static", {}).get(name, {}), "current", False)
+
+    entries = payload.get("timeline", {}).get(name)
+    if not entries:
+        raise ValueError(f"no career timeline for {name}; retrain the model")
+
+    if selector == "prime":
+        idx = payload.get("prime_index", {}).get(name)
+        if idx is None:
+            raise ValueError(f"no prime computed for {name}; retrain the model")
+        entry = entries[idx]
+        low = bool(payload.get("prime_low_confidence", {}).get(name, False))
+        label = f"prime ({str(entry['date'])[:10]})"
+    elif isinstance(selector, dict) and "fight_id" in selector:
+        fid = int(selector["fight_id"])
+        pos = payload.get("fight_index", {}).get(name, {}).get(fid)
+        if pos is None:
+            raise ValueError(f"{name} has no fight with id {fid}")
+        entry = entries[pos]
+        low = False
+        label = f"as of {str(entry['date'])[:10]} vs {entry['opponent']}"
+    elif isinstance(selector, dict) and "date" in selector:
+        target = pd.Timestamp(selector["date"])
+        chosen = None
+        for e in entries:
+            if pd.notna(e["date"]) and e["date"] <= target:
+                chosen = e
+            else:
+                break
+        if chosen is None:
+            raise ValueError(f"{name} had not fought on/before {selector['date']}")
+        entry = chosen
+        low = False
+        label = f"as of {str(entry['date'])[:10]}"
+    else:
+        raise ValueError(f"unrecognised snapshot selector: {selector!r}")
+
+    return (entry["snap"], set(entry["divisions_as_of"]),
+            _static_from_entry(entry), label, low)
 
 
 # --------------------------------------------------------------------------- #
@@ -722,6 +1111,11 @@ def train(db_path: Optional[str] = None, verbose: bool = True) -> dict:
 
     Returns a metrics dict and writes ``models/predictor.joblib``.
     """
+    with telemetry.span("ml.train", {"ml.db_path": db_path or ""}):
+        return _train_impl(db_path=db_path, verbose=verbose)
+
+
+def _train_impl(db_path: Optional[str] = None, verbose: bool = True) -> dict:
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
     from sklearn.impute import SimpleImputer
@@ -737,7 +1131,8 @@ def train(db_path: Optional[str] = None, verbose: bool = True) -> dict:
     finally:
         conn.close()
 
-    X, y, dates, snapshots, divisions, static = build_training_frame(fighters, fights)
+    (X, y, dates, snapshots, divisions, static,
+     timeline_artifacts, method_artifacts) = build_training_frame(fighters, fights)
 
     if X.empty:
         raise ValueError("No label-eligible fights found; cannot train.")
@@ -793,6 +1188,7 @@ def train(db_path: Optional[str] = None, verbose: bool = True) -> dict:
         "test_accuracy": results[best_name]["accuracy"],
         "test_log_loss": results[best_name]["log_loss"],
         "test_brier": results[best_name]["brier"],
+        "method": method_artifacts["metrics"],
     }
 
     # --- persist everything predict() needs -------------------------------- #
@@ -807,6 +1203,15 @@ def train(db_path: Optional[str] = None, verbose: bool = True) -> dict:
         "static": static,
         "metrics": metrics,
         "now": str((pd.to_datetime(fights["date"], errors="coerce")).max()),
+        # Career-timeline + prime artifacts (derived from the leakage-safe walk).
+        "timeline": timeline_artifacts["timeline"],
+        "prime_index": timeline_artifacts["prime_index"],
+        "prime_low_confidence": timeline_artifacts["prime_low_confidence"],
+        "fight_index": timeline_artifacts["fight_index"],
+        # Method-of-victory artifacts.
+        "method_base_rate": method_artifacts["base_rate"],
+        "method_kappa": method_artifacts["kappa"],
+        "method_metrics": method_artifacts["metrics"],
     }
     joblib.dump(payload, MODEL_PATH)
 
@@ -834,6 +1239,10 @@ def _print_metrics(metrics: dict) -> None:
     print(f"{'baseline: more experienced':<26}{b['more_experienced']:>10.4f}")
     print(f"{'baseline: base rate (A wins)':<26}{b['base_rate']:>10.4f}")
     print(f"\nBest model (by test log-loss): {metrics['best_model']}")
+    mm = metrics.get("method")
+    if mm and mm.get("n_test"):
+        print(f"Method-of-victory (held-out, n={mm['n_test']}): log-loss "
+              f"{mm['log_loss']:.4f} vs base-rate baseline {mm['baseline_log_loss']:.4f}")
     if metrics["test_accuracy"] > 0.70:
         print("WARNING: test accuracy > 70% -- RED FLAG for temporal leakage; "
               "honest MMA models land ~60-65%. Investigate the feature builder.")
@@ -867,6 +1276,58 @@ def available_fighters(path: str = MODEL_PATH) -> list:
     return sorted(payload["snapshots"].keys())
 
 
+def available_snapshots(name: str, path: str = MODEL_PATH) -> list:
+    """Metadata-only list of a fighter's selectable career snapshots (oldest first).
+
+    Each item: ``{index, fight_id, date, opponent, result, weight_class, record,
+    elo, win_streak, is_prime}``. The heavy feature dicts are stripped. Callers
+    add the Current/Prime anchors in their UI. Returns ``[]`` if the fighter or
+    timeline is absent (e.g. a legacy payload).
+    """
+    payload = load_model(path)
+    entries = payload.get("timeline", {}).get(name, [])
+    prime_idx = payload.get("prime_index", {}).get(name)
+    out = []
+    for i, e in enumerate(entries):
+        wins, losses = e["record_pre"]
+        out.append({
+            "index": i,
+            "fight_id": e["fight_id"],
+            "date": str(e["date"])[:10],
+            "opponent": e["opponent"],
+            "result": e["result"],
+            "weight_class": e["weight_class"],
+            "record": f"{wins}-{losses}",
+            "elo": round(float(e["elo"]), 1),
+            "win_streak": int(e["win_streak"]),
+            "is_prime": (i == prime_idx),
+        })
+    return out
+
+
+def fighter_prime(name: str, path: str = MODEL_PATH) -> dict:
+    """Metadata for a fighter's computed prime fight (Elo + win-streak peak)."""
+    payload = load_model(path)
+    entries = payload.get("timeline", {}).get(name, [])
+    idx = payload.get("prime_index", {}).get(name)
+    if not entries or idx is None:
+        return {"name": name, "available": False}
+    e = entries[idx]
+    wins, losses = e["record_pre"]
+    return {
+        "name": name,
+        "available": True,
+        "fight_id": e["fight_id"],
+        "date": str(e["date"])[:10],
+        "opponent": e["opponent"],
+        "result": e["result"],
+        "record": f"{wins}-{losses}",
+        "elo": round(float(e["elo"]), 1),
+        "win_streak": int(e["win_streak"]),
+        "low_confidence": bool(payload.get("prime_low_confidence", {}).get(name, False)),
+    }
+
+
 def _tale_of_tape(static_row, divisions):
     """Human-readable per-fighter summary for the response."""
     age = static_row.get("age_years")
@@ -886,18 +1347,34 @@ def _tale_of_tape(static_row, divisions):
     }
 
 
-def predict(name_a: str, name_b: str, path: str = MODEL_PATH) -> dict:
+def predict(name_a: str, name_b: str, path: str = MODEL_PATH,
+            snap_a=None, snap_b=None) -> dict:
     """Predict P(A beats B). Gating first; symmetric averaging of both orderings.
 
+    ``snap_a`` / ``snap_b`` select WHICH career snapshot of each fighter to use
+    (see ``_resolve_snapshot``): ``None``/``"current"`` (default = latest
+    version), ``"prime"``, ``{"fight_id": int}`` or ``{"date": "YYYY-MM-DD"}``.
+    Mixing eras (e.g. prime A vs current B) is a leakage-safe but out-of-
+    distribution "best-self" comparison, not a forward-valid backtest.
+
     Returns a dict with at least: ``allowed`` (bool), ``reason`` (if refused),
-    ``prob_a``, ``prob_b``, and a per-fighter 'tale of the tape'.
+    ``prob_a``, ``prob_b``, ``method_probs`` (coherent joint win-method split),
+    a per-fighter 'tale of the tape', and the snapshot labels actually used.
     """
+    attrs = {"ml.fighter_a": name_a, "ml.fighter_b": name_b}
+    with telemetry.span("ml.predict", attrs) as sp:
+        result = _predict_impl(name_a, name_b, path, snap_a, snap_b)
+        allowed = result.get("allowed")
+        if allowed is not None:
+            sp.set_attribute("ml.allowed", bool(allowed))
+        return result
+
+
+def _predict_impl(name_a: str, name_b: str, path: str = MODEL_PATH,
+                  snap_a=None, snap_b=None) -> dict:
     payload = load_model(path)
     snaps = payload["snapshots"]
-    divs = payload["divisions"]
-    static = payload["static"]
     pipeline = payload["pipeline"]
-    diff_features = payload["diff_features"]
     feature_columns = payload["feature_columns"]
 
     result = {"name_a": name_a, "name_b": name_b}
@@ -912,12 +1389,18 @@ def predict(name_a: str, name_b: str, path: str = MODEL_PATH) -> dict:
         return {**result, "allowed": False, "reason": "a fighter cannot fight themselves",
                 "prob_a": None, "prob_b": None}
 
-    divs_a = divs.get(name_a, set())
-    divs_b = divs.get(name_b, set())
+    # Resolve the requested snapshot of each fighter (current / prime / as-of).
+    try:
+        sa, divs_a, tstatic_a, label_a, low_a = _resolve_snapshot(payload, name_a, snap_a)
+        sb, divs_b, tstatic_b, label_b, low_b = _resolve_snapshot(payload, name_b, snap_b)
+    except ValueError as e:
+        return {**result, "allowed": False, "reason": str(e),
+                "prob_a": None, "prob_b": None}
+
     gate = gate_matchup(divs_a, divs_b)
 
-    tale_a = _tale_of_tape(static.get(name_a, {}), divs_a)
-    tale_b = _tale_of_tape(static.get(name_b, {}), divs_b)
+    tale_a = _tale_of_tape(tstatic_a, divs_a)
+    tale_b = _tale_of_tape(tstatic_b, divs_b)
 
     if not gate["allowed"]:
         return {
@@ -929,16 +1412,16 @@ def predict(name_a: str, name_b: str, path: str = MODEL_PATH) -> dict:
             "distance": gate["distance"],
             "tale_a": tale_a,
             "tale_b": tale_b,
+            "snap_a_label": label_a,
+            "snap_b_label": label_b,
         }
 
-    snap_a = snaps[name_a]
-    snap_b = snaps[name_b]
-    stance_mismatch = 1.0 if snap_a.get("southpaw") != snap_b.get("southpaw") else 0.0
+    stance_mismatch = 1.0 if sa.get("southpaw") != sb.get("southpaw") else 0.0
     # Title-bout context is a property of a hypothetical bout; default 0.
     title_bout = 0.0
 
-    row_ab = _diff_row(snap_a, snap_b, stance_mismatch, title_bout)
-    row_ba = _diff_row(snap_b, snap_a, stance_mismatch, title_bout)
+    row_ab = _diff_row(sa, sb, stance_mismatch, title_bout)
+    row_ba = _diff_row(sb, sa, stance_mismatch, title_bout)
     X = pd.DataFrame([row_ab, row_ba], columns=feature_columns)
 
     proba = pipeline.predict_proba(X)[:, 1]
@@ -948,6 +1431,15 @@ def predict(name_a: str, name_b: str, path: str = MODEL_PATH) -> dict:
     prob_a = 0.5 * (p_ab + (1.0 - p_ba_as_a))
     prob_b = 1.0 - prob_a
 
+    # Coherent joint win-method distribution (None on legacy payloads that
+    # predate the method base rate -> the win prediction still works).
+    method_probs = None
+    base_rate = payload.get("method_base_rate")
+    if base_rate:
+        method_probs = method_split(
+            sa, sb, prob_a, prob_b, base_rate,
+            payload.get("method_kappa", METHOD_PRIOR_KAPPA))
+
     metrics = payload.get("metrics", {})
     return {
         **result,
@@ -955,10 +1447,13 @@ def predict(name_a: str, name_b: str, path: str = MODEL_PATH) -> dict:
         "reason": None,
         "prob_a": prob_a,
         "prob_b": prob_b,
-        "low_confidence": gate.get("low_confidence", False),
+        "low_confidence": bool(gate.get("low_confidence", False) or low_a or low_b),
         "distance": gate.get("distance"),
         "tale_a": tale_a,
         "tale_b": tale_b,
+        "snap_a_label": label_a,
+        "snap_b_label": label_b,
+        "method_probs": method_probs,
         "model": metrics.get("best_model"),
         "test_accuracy": metrics.get("test_accuracy"),
     }
@@ -972,6 +1467,9 @@ def _print_prediction(res: dict) -> None:
     a, b = res["name_a"], res["name_b"]
     print(f"\n{a}  vs  {b}")
     print("-" * (len(a) + len(b) + 8))
+    la, lb = res.get("snap_a_label", "current"), res.get("snap_b_label", "current")
+    if la != "current" or lb != "current":
+        print(f"snapshot: {a} = {la}  |  {b} = {lb}")
     if not res["allowed"]:
         print(f"REFUSED: {res['reason']}")
         return
@@ -979,7 +1477,19 @@ def _print_prediction(res: dict) -> None:
     print(f"P({a} wins) = {pa:.1%}")
     print(f"P({b} wins) = {pb:.1%}")
     if res.get("low_confidence"):
-        print("(weight class unknown for one fighter -> low confidence)")
+        print("(low confidence -- unknown weight class or a cross-era snapshot)")
+    mp = res.get("method_probs")
+    if mp:
+        nice = {"decision": "decision", "ko_tko": "KO/TKO", "submission": "submission"}
+        outcomes = []
+        for who_name, slot in ((a, "a"), (b, "b")):
+            for cls in METHOD_CLASSES:
+                outcomes.append((mp[slot][cls], f"{who_name} by {nice[cls]}"))
+        outcomes.sort(reverse=True)
+        print("\nHow it ends (every outcome, summing to 100%):")
+        for i, (p, label) in enumerate(outcomes):
+            tag = "  <- most likely" if i == 0 else ""
+            print(f"  {label:<34}{p:>6.1%}{tag}")
     ta, tb = res["tale_a"], res["tale_b"]
     print("\nTale of the tape:")
     keys = ["elo", "age", "record", "reach_in", "height_in", "stance",
@@ -992,6 +1502,24 @@ def _print_prediction(res: dict) -> None:
               f"{res['test_accuracy']:.1%})")
 
 
+def _parse_selector(value):
+    """Parse a CLI snapshot selector: 'prime' | 'current' | a date | a fight_id."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    low = v.lower()
+    if low == "prime":
+        return "prime"
+    if low in ("current", "latest"):
+        return None
+    if "-" in v and len(v) >= 8:        # looks like a YYYY-MM-DD date
+        return {"date": v}
+    try:
+        return {"fight_id": int(v)}
+    except ValueError:
+        return None
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="UFC fight-outcome predictor: P(A beats B).")
@@ -1002,7 +1530,16 @@ def main(argv=None) -> int:
                         help="Path to data/ufc.db (default: ml/../data/ufc.db).")
     parser.add_argument("--a", default=None, help="Fighter A name.")
     parser.add_argument("--b", default=None, help="Fighter B name.")
+    parser.add_argument("--as-of-a", default=None, dest="as_of_a",
+                        help="Snapshot for A: 'prime', a fight_id, or a date "
+                             "YYYY-MM-DD (default: current/latest).")
+    parser.add_argument("--as-of-b", default=None, dest="as_of_b",
+                        help="Snapshot for B: 'prime', a fight_id, or a date "
+                             "YYYY-MM-DD (default: current/latest).")
+    parser.add_argument("--timeline", default=None, metavar="NAME",
+                        help="Print a fighter's selectable career snapshots and exit.")
     args = parser.parse_args(argv)
+    telemetry.setup(service_name="mma-predict")
 
     if args.train:
         try:
@@ -1012,9 +1549,29 @@ def main(argv=None) -> int:
             return 2
         return 0
 
+    if args.timeline:
+        try:
+            snaps = available_snapshots(args.timeline)
+        except FileNotFoundError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        if not snaps:
+            print(f"No career timeline for {args.timeline!r} "
+                  f"(unknown fighter, or retrain the model).")
+            return 0
+        print(f"\nCareer snapshots for {args.timeline}:")
+        for s in snaps:
+            star = "  *PRIME" if s["is_prime"] else ""
+            print(f"  [{s['fight_id']}] {s['date']}  {s['result']} vs "
+                  f"{s['opponent']:<22} {s['record']:>7}  Elo {s['elo']:>6.0f}  "
+                  f"streak {s['win_streak']}{star}")
+        return 0
+
     if args.a and args.b:
         try:
-            res = predict(args.a, args.b)
+            res = predict(args.a, args.b,
+                          snap_a=_parse_selector(args.as_of_a),
+                          snap_b=_parse_selector(args.as_of_b))
         except FileNotFoundError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2

@@ -13,12 +13,12 @@ Design goals:
   * Flush after EVERY line so the Rust client never blocks.
   * NEVER crash on bad input -> emit ``{"ok": false, "error": ...}`` instead.
 
-Canned roster (sorted, 3 fighters):
-    ["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]
+Canned roster (sorted, 4 fighters):
+    ["Alex Pereira", "Israel Adesanya", "Joaquin Buckley", "Robert Whittaker"]
 
 Responses:
     ping       -> {"ok": true}
-    status     -> {"ok": true, "model_loaded": true, "n_fighters": 3,
+    status     -> {"ok": true, "model_loaded": true, "n_fighters": 4,
                    "metrics": {"test_accuracy": 0.6}, "model_path": "<stub>"}
     roster     -> {"ok": true, "fighters": [...the 3 above...]}
     eligibility-> {"ok": true, "rules": {...RULES...},
@@ -29,7 +29,7 @@ Responses:
     predict    -> {"ok": true, "result": {... allowed, prob_a 0.62 / prob_b 0.38,
                    full tale_a / tale_b with every key, model "stub",
                    test_accuracy 0.6 ...}}
-    reload     -> {"ok": true, "model_loaded": true, "n_fighters": 3}
+    reload     -> {"ok": true, "model_loaded": true, "n_fighters": 4}
     anything else / bad input -> {"ok": false, "error": "..."}
 
 ELIGIBILITY (startup, ONE shot): the TUI calls ``eligibility`` exactly once at
@@ -45,6 +45,7 @@ per-selection round-trip). The response carries:
     local filter TESTABLE:
         "Alex Pereira"     -> [["M", 8]]   # Heavyweight  (the ODD ONE OUT)
         "Israel Adesanya"  -> [["M", 6]]   # Middleweight
+        "Joaquin Buckley"  -> [["W", 1]]   # Women's straw (has `q` for search tests)
         "Robert Whittaker" -> [["M", 6]]   # Middleweight
 
 So the local rule (min |ord_a - ord_b| <= rules.max_distance on a shared gender)
@@ -72,7 +73,7 @@ import json
 import sys
 
 # Sorted to match the real sidecar (which sorts snapshot keys).
-ROSTER = ["Alex Pereira", "Israel Adesanya", "Robert Whittaker"]
+ROSTER = ["Alex Pereira", "Israel Adesanya", "Joaquin Buckley", "Robert Whittaker"]
 MODEL_PATH = "<stub>/predictor.joblib"
 TEST_ACCURACY = 0.6
 
@@ -95,6 +96,7 @@ RULES = {
 DIVISIONS = {
     "Alex Pereira": [["M", 8]],      # Heavyweight  -> the ineligible odd one out
     "Israel Adesanya": [["M", 6]],   # Middleweight
+    "Joaquin Buckley": [["W", 1]],   # Women's straw -> `q` in the name; not a men's opponent
     "Robert Whittaker": [["M", 6]],  # Middleweight
 }
 
@@ -128,8 +130,25 @@ def _tale(elo, age, record, reach_in, height_in, stance,
     }
 
 
-def _predict_result(name_a, name_b):
-    """Deterministic ALLOWED prediction: prob_a 0.62, prob_b 0.38."""
+def _snap_label(selector):
+    """Human label for a snapshot selector (mirrors predict._resolve_snapshot)."""
+    if selector in (None, "current", "latest"):
+        return "current"
+    if selector == "prime":
+        return "prime (2019-10-05)"
+    if isinstance(selector, dict) and "fight_id" in selector:
+        return "as of fight %s" % selector["fight_id"]
+    if isinstance(selector, dict) and "date" in selector:
+        return "as of %s" % selector["date"]
+    return "current"
+
+
+def _predict_result(name_a, name_b, snap_a=None, snap_b=None):
+    """Deterministic ALLOWED prediction: prob_a 0.62, prob_b 0.38.
+
+    ``method_probs`` is a coherent joint distribution: each fighter's three values
+    sum to that fighter's win probability and all six sum to 1.
+    """
     return {
         "name_a": name_a,
         "name_b": name_b,
@@ -153,7 +172,33 @@ def _predict_result(name_a, name_b):
         ),
         "model": "stub",
         "test_accuracy": TEST_ACCURACY,
+        "snap_a_label": _snap_label(snap_a),
+        "snap_b_label": _snap_label(snap_b),
+        # Coherent joint method split: a sums to 0.62, b to 0.38, total 1.0.
+        "method_probs": {
+            "a": {"decision": 0.30, "ko_tko": 0.28, "submission": 0.04},
+            "b": {"decision": 0.20, "ko_tko": 0.15, "submission": 0.03},
+            # Each fighter's own "if they win" split (joint / P(win), sums to 1).
+            "a_given_win": {"decision": 0.30 / 0.62, "ko_tko": 0.28 / 0.62,
+                            "submission": 0.04 / 0.62},
+            "b_given_win": {"decision": 0.20 / 0.38, "ko_tko": 0.15 / 0.38,
+                            "submission": 0.03 / 0.38},
+            "kappa": 6.0,
+        },
     }
+
+
+# Canned career timeline for the "timeline" command. Two snapshots, the second
+# flagged as the computed prime (mirrors predict.available_snapshots()).
+def _timeline(name):
+    return [
+        {"index": 0, "fight_id": 101, "date": "2018-02-10", "opponent": "Rob Wilkinson",
+         "result": "w", "weight_class": "Middleweight Bout", "record": "0-0",
+         "elo": 1500.0, "win_streak": 0, "is_prime": False},
+        {"index": 1, "fight_id": 102, "date": "2019-10-05", "opponent": "Robert Whittaker",
+         "result": "w", "weight_class": "Middleweight Bout", "record": "6-0",
+         "elo": 1606.0, "win_streak": 6, "is_prime": True},
+    ]
 
 
 def handle(req):
@@ -192,7 +237,14 @@ def handle(req):
         if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
             return {"id": rid, "ok": False,
                     "error": "predict requires string fields 'a' and 'b'"}
-        return {"id": rid, "ok": True, "result": _predict_result(a, b)}
+        result = _predict_result(a, b, req.get("snap_a"), req.get("snap_b"))
+        return {"id": rid, "ok": True, "result": result}
+    if cmd == "timeline":
+        name = req.get("name")
+        if not isinstance(name, str) or not name:
+            return {"id": rid, "ok": False,
+                    "error": "timeline requires a string field 'name'"}
+        return {"id": rid, "ok": True, "name": name, "snapshots": _timeline(name)}
     if cmd == "reload":
         return {"id": rid, "ok": True,
                 "model_loaded": True, "n_fighters": len(ROSTER)}

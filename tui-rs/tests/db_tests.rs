@@ -12,6 +12,10 @@
 //! `use crate::models::...`, so we also pull in `src/models.rs` as the test
 //! crate's `models` module so that path resolves identically.
 
+// The `#[path]`-included modules are whole `src/` files; each test crate only
+// exercises a slice of them, so the rest is legitimately unused here.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -342,6 +346,23 @@ fn load_fighters_orders_by_name_and_maps_nulls() {
 }
 
 #[test]
+fn load_radar_stats_selects_six_axes_and_omits_sapm() {
+    let tmp = TempDb::new();
+    let db = tmp.open();
+    let rows = db.load_radar_stats().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|(_, axes)| axes.len() == 6));
+
+    let jones = rows.iter().find(|(n, _)| n == "Jon Jones").unwrap();
+    assert_eq!(jones.1[0], Some(4.29)); // slpm
+    assert_eq!(jones.1[1], Some(0.57)); // str_acc
+    assert_eq!(jones.1[5], Some(0.5)); // sub_avg
+
+    let silva = rows.iter().find(|(n, _)| n == "Anderson Silva").unwrap();
+    assert!(silva.1.iter().all(Option::is_none));
+}
+
+#[test]
 fn search_fighters_empty_returns_all() {
     let tmp = TempDb::new();
     let db = tmp.open();
@@ -427,6 +448,48 @@ fn load_events_most_recent_first_nulls_last() {
     assert_eq!(events[2].title, "UFC TBD");
     assert_eq!(events[2].date, None);
     assert_eq!(events[2].location, None);
+}
+
+#[test]
+fn next_upcoming_event_chooses_nearest_future_card() {
+    let tmp = TempDb::new();
+    {
+        let conn = Connection::open(&tmp.path).expect("open temp db for future events");
+        conn.execute(
+            "INSERT INTO events (event_id, title, date, location)
+             VALUES (4, 'UFC Far Future', '2099-03-01', 'Future City')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (event_id, title, date, location)
+             VALUES (5, 'UFC Next', '2099-01-10', 'Soon City')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (event_id, title, date, location)
+             VALUES (6, 'UFC Same Day Later Insert', '2099-01-10', 'Tie City')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = tmp.open();
+    let ev = db
+        .next_upcoming_event_on_or_after("2099-01-01")
+        .unwrap()
+        .expect("future event");
+    assert_eq!(ev.title, "UFC Same Day Later Insert");
+    assert_eq!(ev.date.as_deref(), Some("2099-01-10"));
+}
+
+#[test]
+fn next_upcoming_event_returns_none_when_only_past_or_undated() {
+    let tmp = TempDb::new();
+    let db = tmp.open();
+    let ev = db.next_upcoming_event_on_or_after("2099-01-01").unwrap();
+    assert!(ev.is_none());
 }
 
 #[test]

@@ -252,7 +252,7 @@ def test_no_leakage_first_fight_has_baseline_state():
         {"fight_id": 2, "date": "2021-01-01", "winner_name": "B", "loser_name": "A",
          "weight_class": "Lightweight Bout", "title_bout": 0, "method": "KO/TKO"},
     ])
-    X, y, dates, snaps, divs, static = P.build_training_frame(fighters, fights)
+    X, y, dates, snaps, divs, static, tl_art, m_art = P.build_training_frame(fighters, fights)
 
     # 2 fights x 2 orderings = 4 rows.
     assert len(X) == 4 and len(y) == 4
@@ -276,7 +276,7 @@ def test_no_leakage_second_fight_sees_only_first():
         {"fight_id": 2, "date": "2021-01-01", "winner_name": "B", "loser_name": "A",
          "weight_class": "Lightweight Bout", "title_bout": 0, "method": "KO/TKO"},
     ])
-    X, y, dates, snaps, divs, static = P.build_training_frame(fighters, fights)
+    X, y, dates, snaps, divs, static, tl_art, m_art = P.build_training_frame(fighters, fights)
 
     # Rows 2 and 3 are fight 2 (B as A, then A as A). Both fighters have exactly
     # 1 prior fight -> n_prior_fights_diff == 0, but Elo now differs (A won #1).
@@ -318,7 +318,7 @@ def test_elo_winner_rises():
         {"fight_id": 1, "date": "2020-01-01", "winner_name": "A", "loser_name": "B",
          "weight_class": "Lightweight Bout", "title_bout": 0, "method": "KO/TKO"},
     ])
-    X, y, dates, snaps, divs, static = P.build_training_frame(fighters, fights)
+    X, y, dates, snaps, divs, static, tl_art, m_art = P.build_training_frame(fighters, fights)
     # After one fight, A (winner) Elo > 1500 > B (loser) Elo.
     assert static["A"]["elo"] > P.ELO_START
     assert static["B"]["elo"] < P.ELO_START
@@ -380,11 +380,13 @@ def trained_model(tmp_path_factory):
             # winner: the higher index half the time, alternate for variety
             winner, loser = (b, a) if (j + yi) % 3 != 0 else (a, b)
             fid += 1
+            # Vary the finish method so method_base_rate covers all three classes.
+            method = ("KO/TKO", "Submission", "Decision - Unanimous")[fid % 3]
             cur.execute("INSERT INTO fights (fight_id,event_id,event_name,date,winner_name,"
                         "loser_name,weight_class,title_bout,method,round_ended,time_ended) "
                         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (fid, 1, "E", f"{year}-06-15", winner, loser,
-                         "Lightweight Bout", 0, "KO/TKO", 1, 60))
+                         "Lightweight Bout", 0, method, 1, 60))
     conn.commit()
     conn.close()
 
@@ -428,9 +430,185 @@ def test_predict_unknown_fighter(trained_model):
 def test_predict_payload_has_required_keys(trained_model):
     payload = P.load_model(trained_model, force=True)
     for key in ("pipeline", "feature_columns", "snapshots", "divisions",
-                "static", "metrics"):
+                "static", "metrics",
+                # career-timeline + prime artifacts
+                "timeline", "prime_index", "prime_low_confidence", "fight_index",
+                # method-of-victory artifacts
+                "method_base_rate", "method_kappa", "method_metrics"):
         assert key in payload
     # Metrics carry both models + baselines.
     m = payload["metrics"]
     assert "models" in m and "baselines" in m
     assert "logreg" in m["models"] and "hgb" in m["models"]
+
+
+# --------------------------------------------------------------------------- #
+# 6) Career timeline + as-of-fight snapshots
+# --------------------------------------------------------------------------- #
+
+def test_default_snapshot_is_current(trained_model):
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    r_default = P.predict(a, b, path=trained_model)
+    r_current = P.predict(a, b, path=trained_model, snap_a="current", snap_b="current")
+    assert r_default["prob_a"] == pytest.approx(r_current["prob_a"], abs=1e-12)
+    assert r_default["snap_a_label"] == "current"
+
+
+def test_available_snapshots_and_as_of_fight(trained_model):
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    snaps = P.available_snapshots(a, path=trained_model)
+    assert snaps and all("fight_id" in s for s in snaps)
+    # Exactly one snapshot is flagged prime.
+    assert sum(1 for s in snaps if s["is_prime"]) == 1
+    # Selecting a specific past fight produces a valid, allowed prediction whose
+    # snapshot label names that fight's date.
+    fid = snaps[-1]["fight_id"]
+    res = P.predict(a, b, path=trained_model, snap_a={"fight_id": fid})
+    assert res["allowed"] and "as of" in res["snap_a_label"]
+
+
+def test_as_of_snapshot_value_identity(trained_model):
+    """A snapshot selected by fight_id reproduces that fight's trained feature row.
+
+    Proves the persisted timeline snapshot is the SAME object the model trained on
+    (the core leakage-safety guarantee of the timeline design).
+    """
+    payload = P.load_model(trained_model, force=True)
+    # Pick a fighter and one of their non-debut fights.
+    name = list(payload["snapshots"].keys())[0]
+    entries = payload["timeline"][name]
+    entry = entries[len(entries) // 2]
+    snap_from_timeline = entry["snap"]
+    # The snapshot's prior-fight count matches its position-derived history.
+    assert snap_from_timeline["n_prior_fights"] == entry["n_prior_fights"]
+    # record_pre is strictly before this fight (never includes its own result).
+    wins_pre, losses_pre = entry["record_pre"]
+    assert wins_pre + losses_pre == int(entry["n_prior_fights"])
+
+
+# --------------------------------------------------------------------------- #
+# 7) Prime detection (Elo + win-streak blend)
+# --------------------------------------------------------------------------- #
+
+def test_pick_prime_smoothing_beats_single_spike():
+    # A lone one-fight Elo spike (index 4) must NOT win against a sustained high
+    # plateau at the end (indices 7-9): raw argmax would pick the spike, but the
+    # centred smoothing makes the sustained run win.
+    def entry(elo, n, streak):
+        return {"elo": elo, "n_prior_fights": n, "win_streak": streak}
+    elos = [1500, 1510, 1520, 1530, 1800, 1530, 1540, 1650, 1655, 1660]
+    entries = [entry(e, i, min(i, 4)) for i, e in enumerate(elos)]
+    idx, low = P._pick_prime(entries)
+    assert low is False
+    assert idx != 4                      # the lone spike is smoothed away
+    assert idx >= 7                      # the sustained late plateau wins
+
+
+def test_pick_prime_short_career_low_confidence():
+    entries = [{"elo": 1500 + 10 * i, "n_prior_fights": i, "win_streak": i}
+               for i in range(2)]        # nobody clears PRIME_MIN_FIGHTS=3
+    idx, low = P._pick_prime(entries)
+    assert low is True
+    assert 0 <= idx < len(entries)
+
+
+def test_prime_vs_prime_symmetry(trained_model):
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    r_ab = P.predict(a, b, path=trained_model, snap_a="prime", snap_b="prime")
+    r_ba = P.predict(b, a, path=trained_model, snap_a="prime", snap_b="prime")
+    assert r_ab["allowed"] and r_ba["allowed"]
+    assert r_ab["prob_a"] == pytest.approx(r_ba["prob_b"], abs=1e-9)
+    assert (r_ab["prob_a"] + r_ab["prob_b"]) == pytest.approx(1.0, abs=1e-9)
+    assert "prime" in r_ab["snap_a_label"]
+
+
+# --------------------------------------------------------------------------- #
+# 8) Method-of-victory probabilities
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Decision - Unanimous", "decision"),
+    ("Decision - Split", "decision"),
+    ("KO/TKO", "ko_tko"),
+    ("TKO - Doctor's Stoppage", "ko_tko"),
+    ("Submission", "submission"),
+    ("Overturned", None),
+    ("Could Not Continue", None),
+    ("DQ", None),
+    ("Other", None),
+    (None, None),
+])
+def test_method_class_mapping(raw, expected):
+    assert P._method_class(raw) == expected
+
+
+def test_method_probs_coherent(trained_model):
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    res = P.predict(a, b, path=trained_model)
+    mp = res["method_probs"]
+    assert mp is not None
+    # Each fighter's three method probs sum to that fighter's win probability.
+    assert sum(mp["a"].values()) == pytest.approx(res["prob_a"], abs=1e-9)
+    assert sum(mp["b"].values()) == pytest.approx(res["prob_b"], abs=1e-9)
+    # All six outcomes form a coherent distribution summing to 1.
+    total = sum(mp["a"].values()) + sum(mp["b"].values())
+    assert total == pytest.approx(1.0, abs=1e-9)
+
+
+def test_method_probs_symmetry(trained_model):
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    r_ab = P.predict(a, b, path=trained_model)
+    r_ba = P.predict(b, a, path=trained_model)
+    for cls in P.METHOD_CLASSES:
+        assert r_ab["method_probs"]["a"][cls] == pytest.approx(
+            r_ba["method_probs"]["b"][cls], abs=1e-9)
+        assert r_ab["method_probs"]["a_given_win"][cls] == pytest.approx(
+            r_ba["method_probs"]["b_given_win"][cls], abs=1e-9)
+
+
+def test_method_probs_given_win_is_each_fighters_own_split(trained_model):
+    # Both fighters (favourite AND underdog) get a conditional "if they win"
+    # split that sums to 1 and is consistent with the joint: joint = P(win) x share.
+    payload = P.load_model(trained_model, force=True)
+    a, b = list(payload["snapshots"].keys())[:2]
+    res = P.predict(a, b, path=trained_model)
+    mp = res["method_probs"]
+    for side, prob in (("a", res["prob_a"]), ("b", res["prob_b"])):
+        given = mp[f"{side}_given_win"]
+        assert set(given) == set(P.METHOD_CLASSES)
+        assert sum(given.values()) == pytest.approx(1.0, abs=1e-9)
+        for cls in P.METHOD_CLASSES:
+            assert 0.0 <= given[cls] <= 1.0
+            assert mp[side][cls] == pytest.approx(prob * given[cls], abs=1e-9)
+
+
+def test_conditional_method_dist_debut_is_base_rate():
+    # A fighter/opponent with NO prior method data must shrink fully to the base
+    # rate (pure prior), with no NaN / division-by-zero.
+    base = {"decision": 0.5, "ko_tko": 0.3, "submission": 0.2}
+    q = P._conditional_method_dist([0, 0, 0], [0, 0, 0], base, P.METHOD_PRIOR_KAPPA)
+    for cls in P.METHOD_CLASSES:
+        assert q[cls] == pytest.approx(base[cls], abs=1e-9)
+
+
+def test_method_counters_leakage_safe():
+    """A debut fighter's snapshot carries all-zero method counters, and the
+    counters never entered the win-model FEATURE_COLUMNS."""
+    fighters = _make_fighters(["A", "B"])
+    fights = pd.DataFrame([
+        {"fight_id": 1, "date": "2020-01-01", "winner_name": "A", "loser_name": "B",
+         "weight_class": "Lightweight Bout", "title_bout": 0, "method": "Submission"},
+    ])
+    X, y, dates, snaps, divs, static, tl_art, m_art = P.build_training_frame(fighters, fights)
+    # The first timeline entry for A is its debut: no prior method outcomes.
+    first = tl_art["timeline"]["A"][0]["snap"]
+    assert first["w_decision"] == first["w_ko_tko"] == first["w_submission"] == 0
+    assert first["l_decision"] == first["l_ko_tko"] == first["l_submission"] == 0
+    # The six counters must NOT have leaked into the win-model features.
+    for col in X.columns:
+        assert "decision" not in col and "ko_tko" not in col and "submission" not in col

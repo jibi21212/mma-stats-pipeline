@@ -208,12 +208,19 @@ mod tests {
     fn indeterminate_progress_starts_empty_and_never_resets() {
         // The whole point of the fix: sampled across a long run it only ever goes
         // UP. The old sawtooth went 0→~1→0 repeatedly; this must not.
-        assert_eq!(indeterminate_progress(0.0), 0.0, "should start empty at t=0");
+        assert_eq!(
+            indeterminate_progress(0.0),
+            0.0,
+            "should start empty at t=0"
+        );
         let mut prev = 0.0;
         let mut t = 0.0;
         while t <= 120.0 {
             let cur = indeterminate_progress(t);
-            assert!(cur >= prev, "progress went backwards at t={t}: {cur} < {prev}");
+            assert!(
+                cur >= prev,
+                "progress went backwards at t={t}: {cur} < {prev}"
+            );
             prev = cur;
             t += 0.5;
         }
